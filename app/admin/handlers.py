@@ -139,20 +139,32 @@ async def _set_destination(message: Message, admin_id: int):
         return
 
     client = workers[0].client
+    # کش شناخته‌شده‌های اکانت را تازه می‌کنیم تا کانالی که تازه عضو/ادمین شده شناخته شود
+    try:
+        async for _ in client.get_dialogs():
+            pass
+    except Exception as e:
+        logger.warning(f"dialog refresh failed: {type(e).__name__}")
     try:
         resolved = await client.get_chat(target)
         if not getattr(resolved, "id", None):
-            raise ValueError("account is not a member")
+            # لینک دعوت و اکانت هنوز عضو نیست: با همان لینک عضو می‌شود
+            resolved = await client.join_chat(target)
         test = await client.send_message(resolved.id, "✅ مقصد تنظیم شد (پیام آزمایشی)")
         try:
             await test.delete()
         except Exception:
             pass
     except Exception as e:
-        logger.warning(f"destination check failed: {type(e).__name__}: {e}")
-        await message.reply_text(
-            f"❌ اکانت نتوانست در این مقصد پیام بفرستد ({type(e).__name__}).\n"
-            "اکانت را عضو کنید (در کانال، ادمین با اجازه‌ی ارسال پست) و دوباره بفرستید. لغو: /cancel")
+        name = type(e).__name__
+        logger.warning(f"destination check failed: {name}: {e}")
+        if name in ("ChatWriteForbidden", "ChatAdminRequired", "UserBannedInChannel", "ChatSendPlainForbidden"):
+            hint = "اکانت عضو است ولی اجازه‌ی ارسال ندارد. در کانال، ادمینش کنید و اجازه‌ی «ارسال پست» بدهید."
+        elif name in ("ChannelInvalid", "ChannelPrivate", "PeerIdInvalid", "InviteHashExpired", "InviteHashInvalid"):
+            hint = "اکانت این مقصد را نمی‌شناسد؛ احتمالاً عضو نیست یا لینک نامعتبر است. اکانت را عضو کنید و دوباره بفرستید."
+        else:
+            hint = "اکانت را عضو کنید (در کانال، ادمین با اجازه‌ی ارسال پست) و دوباره بفرستید."
+        await message.reply_text(f"❌ نتوانستم در مقصد پیام بفرستم ({name}).\n{hint}\nلغو: /cancel")
         return
 
     title = getattr(resolved, "title", None) or getattr(resolved, "first_name", None) or ""
