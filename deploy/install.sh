@@ -58,6 +58,8 @@ ENV
   chmod 600 .env
 fi
 
+mkdir -p sessions/admin sessions/users sessions/temp logs
+
 echo "== ساخت جدول‌ها =="
 ./venv/bin/alembic upgrade head
 
