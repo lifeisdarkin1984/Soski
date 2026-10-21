@@ -13,6 +13,7 @@ class MonitoredChannel(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     channel_username: Mapped[str] = mapped_column(String(100), nullable=True)
+    channel_title: Mapped[str] = mapped_column(String(255), nullable=True)
     account_id: Mapped[int] = mapped_column(Integer, ForeignKey("accounts.id", ondelete="CASCADE"), nullable=False)
     last_processed_msg_id: Mapped[int] = mapped_column(BigInteger, default=0, server_default="0")
     added_at: Mapped[datetime] = mapped_column(server_default=func.now())
