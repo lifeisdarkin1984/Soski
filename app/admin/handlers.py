@@ -262,15 +262,15 @@ async def _route(client: Client, cq: CallbackQuery, data: str):
         await _edit(cq, "شماره‌ی اکانت را با کد کشور بفرستید (مثلاً +989123456789).\nبرای لغو: /cancel",
                     kb([[("🔙 انصراف", "main")]]))
 
-    elif data == "channels":
-        async with AsyncSessionLocal() as db:
-            total = (await db.execute(select(func.count()).select_from(MonitoredChannel))).scalar_one()
-            rows = (await db.execute(
-                select(MonitoredChannel).order_by(MonitoredChannel.added_at.desc()).limit(15))).scalars().all()
-        lines = [f"کانال‌های تحت نظر: {total}", ""]
-        lines += [f"• {('@' + c.channel_username) if c.channel_username else c.channel_id}  (اکانت {c.account_id})"
-                  for c in rows]
-        await _edit(cq, "\n".join(lines), BACK)
+    elif data == "channels" or data.startswith("channels_"):
+        page = int(data.split("_")[1]) if "_" in data else 0
+        await _channels_page(cq, page)
+
+    elif data == "sync_channels":
+        for worker in list(worker_manager.workers.values()):
+            if worker.is_running:
+                await worker.sync_now()
+        await _channels_page(cq, 0)
 
     elif data == "history":
         async with AsyncSessionLocal() as db:
@@ -316,6 +316,30 @@ async def _route(client: Client, cq: CallbackQuery, data: str):
         await _edit(cq, "در حال ری‌استارت ورکرها...")
         started = await account_manager.restart_all()
         await _edit(cq, f"{started} ورکر دوباره شروع شد.", BACK)
+
+
+PAGE_SIZE = 15
+
+
+async def _channels_page(cq: CallbackQuery, page: int):
+    page = max(page, 0)
+    async with AsyncSessionLocal() as db:
+        total = (await db.execute(select(func.count()).select_from(MonitoredChannel))).scalar_one()
+        rows = (await db.execute(select(MonitoredChannel).order_by(MonitoredChannel.id)
+                                 .offset(page * PAGE_SIZE).limit(PAGE_SIZE))).scalars().all()
+    lines = [f"کانال‌های تحت نظر: {total}  (صفحه {page + 1})", ""]
+    for c in rows:
+        name = c.channel_title or (f"@{c.channel_username}" if c.channel_username else "بدون نام")
+        lines.append(f"• {name}  [{c.channel_id}]")
+    if not rows:
+        lines.append("چیزی در این صفحه نیست.")
+    nav = []
+    if page > 0:
+        nav.append(("◀ قبلی", f"channels_{page - 1}"))
+    if (page + 1) * PAGE_SIZE < total:
+        nav.append(("بعدی ▶", f"channels_{page + 1}"))
+    rows_kb = ([nav] if nav else []) + [[("🔄 همگام‌سازی الان", "sync_channels")], [("🔙 منوی اصلی", "main")]]
+    await _edit(cq, "\n".join(lines), kb(rows_kb))
 
 
 async def _account_detail(cq: CallbackQuery, account_id: int):
