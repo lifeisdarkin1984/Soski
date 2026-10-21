@@ -1,5 +1,11 @@
 import asyncio
 import signal
+
+# پایروگرام هنگام ساخت Client (موقع import) حلقه‌ی asyncio را می‌گیرد؛ پس حلقه را قبل از import ها می‌سازیم
+# و همان را اجرا می‌کنیم تا «attached to a different loop» پیش نیاید.
+loop = asyncio.new_event_loop()
+asyncio.set_event_loop(loop)
+
 from app.core.logger import logger
 from app.core.config import settings
 from app.core.database import engine, AsyncSessionLocal
@@ -21,10 +27,10 @@ async def main():
         logger.error("ADMIN_IDS is empty. Set at least one admin Telegram user id in .env")
         return
 
-    loop = asyncio.get_running_loop()
+    running_loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, shutdown_event.set)
+            running_loop.add_signal_handler(sig, shutdown_event.set)
         except NotImplementedError:
             signal.signal(sig, lambda *_: shutdown_event.set())
 
@@ -67,4 +73,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
