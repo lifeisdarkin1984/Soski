@@ -7,7 +7,7 @@ from app.features.detector.bot_detector import bot_detector
 from app.features.detector.analyzer import analyzer
 from app.features.processor.caption_cleaner import caption_cleaner
 from app.features.bot_engine.helpers import (
-    choose_button, pick_bot_message, join_target, build_start_text, get_media, reply_keyboard_texts, parse_destination_input)
+    choose_button, pick_bot_message, join_target, build_start_text, get_media, reply_keyboard_texts, parse_destination_input, unwrap_chat)
 
 
 def ent(kind, offset, length, url=None):
@@ -156,6 +156,15 @@ class DestinationInputTests(unittest.TestCase):
         self.assertIsNone(parse_destination_input(None))
         self.assertIsNone(parse_destination_input("سلام"))
         self.assertIsNone(parse_destination_input("https://example.com/x"))
+
+
+class UnwrapChatTests(unittest.TestCase):
+    def test_variants(self):
+        chat = NS(id=-1001, title="x")
+        self.assertIs(unwrap_chat(chat), chat)                      # خود Chat
+        self.assertIs(unwrap_chat(NS(chat=chat)), chat)              # شیء نتیجه با فیلد chat
+        self.assertIsNone(unwrap_chat(NS()))                         # نتیجه‌ی بدون چت (مثلاً درخواست عضویت)
+        self.assertIsNone(unwrap_chat(None))
 
 
 if __name__ == "__main__":
