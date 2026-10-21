@@ -10,7 +10,7 @@ from app.core.link_parser import link_parser
 from app.repositories.flow_repository import FlowRepository
 from app.models.message import ProcessedMessage, FlowStatus
 from app.features.bot_engine.helpers import (
-    choose_button, get_media, pick_bot_message, join_target, build_start_text, reply_keyboard_texts,
+    choose_button, get_media, pick_bot_message, join_target, build_start_text, reply_keyboard_texts, unwrap_chat,
 )
 
 MAX_INTERACTION_STEPS = 8
@@ -169,7 +169,15 @@ class BotFlowEngine:
         """(موفق؟، آیا همین الان عضو شد؟)"""
         for attempt in range(MAX_JOIN_RETRIES_PER_CHANNEL):
             try:
-                chat = await client.join_chat(target)
+                res = await client.join_chat(target)
+                chat = unwrap_chat(res)
+                if chat is None:
+                    try:
+                        chat = await client.get_chat(target)
+                    except Exception:
+                        chat = None
+                if chat is None:
+                    logger.warning(f"Joined {target} but could not read its id")
                 await flow_repo.add_joined_channel(
                     processed_msg_id, getattr(chat, 'id', 0) or 0,
                     getattr(chat, 'username', None) or parsed.get('username') or parsed.get('invite_hash'))

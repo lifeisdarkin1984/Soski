@@ -101,3 +101,13 @@ def parse_destination_input(text: Optional[str]) -> Union[int, str, None]:
     if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{4,31}", t):
         return t
     return None
+
+
+def unwrap_chat(result: Any) -> Optional[Any]:
+    """join_chat در نسخه‌های مختلف یا خود Chat یا یک شیء نتیجه (با فیلد chat) برمی‌گرداند."""
+    inner = getattr(result, "chat", None)
+    if inner is not None and getattr(inner, "id", None):
+        return inner
+    if getattr(result, "id", None):
+        return result
+    return None
