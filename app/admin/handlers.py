@@ -13,7 +13,7 @@ from app.features.accounts.manager import account_manager, worker_manager
 from app.models import Account, AccountStatus, MonitoredChannel, ProcessedMessage, Delivery
 from app.repositories.message_repository import MessageRepository
 from app.repositories.settings_repository import SettingsRepository, get_destination_info
-from app.features.bot_engine.helpers import parse_destination_input
+from app.features.bot_engine.helpers import parse_destination_input, unwrap_chat
 
 LOG_FILE = os.path.join("logs", "collector.log")
 login_states: dict[int, dict] = {}   # admin_id -> {'step': 'phone'|'code'|'password', 'phone': str}
@@ -149,7 +149,10 @@ async def _set_destination(message: Message, admin_id: int):
         resolved = await client.get_chat(target)
         if not getattr(resolved, "id", None):
             # لینک دعوت و اکانت هنوز عضو نیست: با همان لینک عضو می‌شود
-            resolved = await client.join_chat(target)
+            joined = await client.join_chat(target)
+            resolved = unwrap_chat(joined) or await client.get_chat(target)
+            if not getattr(resolved, "id", None):
+                raise ValueError("join request pending")
         test = await client.send_message(resolved.id, "✅ مقصد تنظیم شد (پیام آزمایشی)")
         try:
             await test.delete()
