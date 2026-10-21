@@ -8,9 +8,10 @@ class ChannelRepository:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def add_monitored_channel(self, channel_id: int, channel_username: str, account_id: int):
+    async def add_monitored_channel(self, channel_id: int, channel_username: str, account_id: int, title: str | None = None):
         new_channel = MonitoredChannel(
-            channel_id=channel_id, channel_username=channel_username, account_id=account_id, last_processed_msg_id=0
+            channel_id=channel_id, channel_username=channel_username, channel_title=title,
+            account_id=account_id, last_processed_msg_id=0
         )
         self.session.add(new_channel)
         try:
@@ -32,5 +33,12 @@ class ChannelRepository:
             MonitoredChannel.account_id == account_id,
             MonitoredChannel.last_processed_msg_id < msg_id,
         ).values(last_processed_msg_id=msg_id)
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def update_meta(self, channel_id: int, account_id: int, username: str | None, title: str | None):
+        stmt = update(MonitoredChannel).where(
+            MonitoredChannel.channel_id == channel_id, MonitoredChannel.account_id == account_id
+        ).values(channel_username=username, channel_title=title)
         await self.session.execute(stmt)
         await self.session.commit()
