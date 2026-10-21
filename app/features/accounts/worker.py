@@ -68,6 +68,9 @@ class AccountWorker:
             channels = await ChannelRepository(db).get_monitored_channels(self.account_id)
         self._monitored_ids = {c.channel_id for c in channels}
 
+    async def sync_now(self):
+        await self._sync_all()
+
     async def _startup_recovery(self):
         try:
             await catch_up_missed(self.client, self.account_id, self.ingest_message)
