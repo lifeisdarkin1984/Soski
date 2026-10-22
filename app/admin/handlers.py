@@ -12,6 +12,8 @@ from app.core.exceptions import AccountAuthError
 from app.features.accounts.manager import account_manager, worker_manager
 from app.models import Account, AccountStatus, MonitoredChannel, ProcessedMessage, Delivery
 from app.repositories.message_repository import MessageRepository
+from app.repositories.channel_repository import ChannelRepository
+from app.features.detector.analyzer import analyzer
 from app.repositories.settings_repository import SettingsRepository, get_destination_info
 from app.features.bot_engine.helpers import parse_destination_input, unwrap_chat
 
@@ -266,6 +268,9 @@ async def _route(client: Client, cq: CallbackQuery, data: str):
         page = int(data.split("_")[1]) if "_" in data else 0
         await _channels_page(cq, page)
 
+    elif data == "detect_test":
+        await _detect_test(cq)
+
     elif data == "sync_channels":
         for worker in list(worker_manager.workers.values()):
             if worker.is_running:
@@ -321,6 +326,58 @@ async def _route(client: Client, cq: CallbackQuery, data: str):
 PAGE_SIZE = 15
 
 
+def _all_links(message) -> list:
+    urls = []
+    markup = getattr(message, "reply_markup", None)
+    for row in getattr(markup, "inline_keyboard", None) or []:
+        for b in row:
+            if getattr(b, "url", None):
+                urls.append(b.url)
+    for e in (getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []):
+        kind = str(getattr(getattr(e, "type", ""), "name", getattr(e, "type", ""))).lower()
+        if kind == "text_link" and getattr(e, "url", None):
+            urls.append(e.url)
+    return urls
+
+
+async def _detect_test(cq: CallbackQuery):
+    """بدون ارسال چیزی: ۴۰ پست آخر هر کانال را با همان تشخیص‌دهنده‌ی اصلی می‌سنجد."""
+    workers = [w for w in worker_manager.workers.values() if w.is_running]
+    if not workers:
+        await _edit(cq, "هیچ اکانتی روشن نیست.", BACK)
+        return
+    await _edit(cq, "در حال بررسی ۴۰ پست آخر هر کانال... چند ثانیه صبر کنید.")
+    total = with_bot = checked = 0
+    samples, others = [], []
+    for w in workers:
+        async with AsyncSessionLocal() as db:
+            channels = await ChannelRepository(db).get_monitored_channels(w.account_id)
+        for ch in channels[:10]:
+            checked += 1
+            name = ch.channel_title or (f"@{ch.channel_username}" if ch.channel_username else ch.channel_id)
+            try:
+                async for m in w.client.get_chat_history(ch.channel_id, limit=40):
+                    total += 1
+                    found = analyzer.analyze_message(m)
+                    if found["is_media_request"]:
+                        with_bot += 1
+                        if len(samples) < 6:
+                            samples.append(f"• {name}: @{found['bot_username']}")
+                    else:
+                        for u in _all_links(m):
+                            if len(others) < 6 and u[:70] not in others:
+                                others.append(u[:70])
+            except Exception as e:
+                logger.warning(f"detect test failed for {ch.channel_id}: {type(e).__name__}: {e}")
+    text = (f"🔍 نتیجه‌ی تست\nکانال‌های بررسی‌شده: {checked}\nپست‌های بررسی‌شده: {total}\n"
+            f"پست‌های دارای لینک ربات: {with_bot}\n")
+    if samples:
+        text += "\nنمونه‌ها:\n" + "\n".join(samples) + "\n"
+    if others:
+        text += "\nلینک‌هایی که ربات نبودند (نمونه):\n" + "\n".join(others)
+    await _edit(cq, text[:3800], kb([[("🔙 کانال‌ها", "channels")], [("🔙 منوی اصلی", "main")]]))
+
+
 async def _channels_page(cq: CallbackQuery, page: int):
     page = max(page, 0)
     async with AsyncSessionLocal() as db:
@@ -338,7 +395,8 @@ async def _channels_page(cq: CallbackQuery, page: int):
         nav.append(("◀ قبلی", f"channels_{page - 1}"))
     if (page + 1) * PAGE_SIZE < total:
         nav.append(("بعدی ▶", f"channels_{page + 1}"))
-    rows_kb = ([nav] if nav else []) + [[("🔄 همگام‌سازی الان", "sync_channels")], [("🔙 منوی اصلی", "main")]]
+    rows_kb = ([nav] if nav else []) + [[("🔄 همگام‌سازی الان", "sync_channels")],
+               [("🔍 تست تشخیص لینک ربات", "detect_test")], [("🔙 منوی اصلی", "main")]]
     await _edit(cq, "\n".join(lines), kb(rows_kb))
 
 
