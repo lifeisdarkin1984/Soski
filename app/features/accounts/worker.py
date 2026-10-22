@@ -63,7 +63,12 @@ class AccountWorker:
 
     async def _sync_all(self):
         await sync_monitored_channels(self.client, self.account_id)
-        await perform_initial_scan(self.client, self.account_id)
+        await self._refresh_monitored_ids()
+        # باید بعد از به‌روزرسانی لیست باشد، وگرنه پست‌های کانال تازه «پایش‌نشده» حساب می‌شوند
+        await perform_initial_scan(self.client, self.account_id, self.ingest_message)
+        await self._refresh_monitored_ids()
+
+    async def _refresh_monitored_ids(self):
         async with AsyncSessionLocal() as db:
             channels = await ChannelRepository(db).get_monitored_channels(self.account_id)
         self._monitored_ids = {c.channel_id for c in channels}
