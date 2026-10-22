@@ -8,25 +8,24 @@ from app.repositories.channel_repository import ChannelRepository
 from app.repositories.message_repository import MessageRepository
 
 
-async def perform_initial_scan(client: Client, account_id: int):
-    """کانال‌های تازه‌ثبت‌شده: پست‌های قدیمی فقط «دیده‌شده» علامت می‌خورند و پردازش نمی‌شوند."""
+async def perform_initial_scan(client: Client, account_id: int,
+                               ingest: Callable[[Message], Awaitable[None]]):
+    """کانال‌های تازه‌ثبت‌شده: آخرین N پست (پیش‌فرض ۱۰۰) از قدیمی به جدید پردازش می‌شوند."""
     async with AsyncSessionLocal() as db:
-        channel_repo = ChannelRepository(db)
-        message_repo = MessageRepository(db)
-        for channel in await channel_repo.get_monitored_channels(account_id):
-            if channel.last_processed_msg_id > 0:
+        channels = await ChannelRepository(db).get_monitored_channels(account_id)
+    for channel in channels:
+        if channel.last_processed_msg_id > 0:
+            continue
+        try:
+            messages = [m async for m in client.get_chat_history(
+                channel.channel_id, limit=settings.initial_scan_count)]
+            if not messages:
                 continue
-            try:
-                messages = [m async for m in client.get_chat_history(
-                    channel.channel_id, limit=settings.initial_scan_count)]
-                last_id = 0
-                for msg in reversed(messages):
-                    await message_repo.mark_as_scanned(channel.channel_id, msg.id, account_id)
-                    last_id = max(last_id, msg.id)
-                if last_id:
-                    await channel_repo.update_last_processed_msg(channel.channel_id, account_id, last_id)
-            except Exception as e:
-                logger.error(f"Initial scan failed for channel {channel.channel_id}: {type(e).__name__}: {e}")
+            for msg in reversed(messages):
+                await ingest(msg)
+            logger.info(f"Initial scan: {len(messages)} post(s) checked in channel {channel.channel_id}")
+        except Exception as e:
+            logger.error(f"Initial scan failed for channel {channel.channel_id}: {type(e).__name__}: {e}")
 
 
 async def catch_up_missed(client: Client, account_id: int, ingest: Callable[[Message], Awaitable[None]]):
