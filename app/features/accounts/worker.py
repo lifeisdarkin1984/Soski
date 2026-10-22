@@ -89,10 +89,13 @@ class AccountWorker:
     # ---------- دریافت پیام ----------
     async def ingest_message(self, message: Message):
         chat_id = message.chat.id
-        if chat_id not in self._monitored_ids:
-            return
+        monitored = chat_id in self._monitored_ids
         try:
             analysis = analyzer.analyze_message(message)
+            logger.info(f"Post {chat_id}/{message.id}: monitored={monitored} "
+                        f"bot={analysis['bot_username'] or '-'}")
+            if not monitored:
+                return
             async with AsyncSessionLocal() as db:
                 if analysis['is_media_request']:
                     p_msg = await MessageRepository(db).mark_as_pending_request(
