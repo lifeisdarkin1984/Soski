@@ -8,7 +8,7 @@ from alembic import context
 from app.core.database import Base
 from app.core.config import settings
 
-from app.models import account, channel, message, flow, delivery, log, setting
+from app.models import account, channel, message, flow, delivery, log, setting, distribution
 
 config = context.config
 

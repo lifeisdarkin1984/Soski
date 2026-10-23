@@ -130,6 +130,14 @@ class Publisher:
             )
             await flow_repo.mark_delivery_sent(delivery_id, sent_id, report)
             await flow_repo.mark_message_completed(processed_msg_id)
+            # ذخیره در مخزن موفق بود ← پست برای انتشار در کانال نهایی صف می‌شود (تکراری بی‌اثر است)
+            if sent_id:
+                try:
+                    from app.features.distribution.runtime import distribution
+                    from app.features.distribution.poster import enqueue_post
+                    await enqueue_post(distribution.store, delivery_id, destination, int(sent_id), caption)
+                except Exception as e:
+                    logger.error(f"Could not queue final post for delivery {delivery_id}: {type(e).__name__}: {e}")
             return True
 
 

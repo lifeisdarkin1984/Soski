@@ -14,6 +14,8 @@ from app.repositories.settings_repository import get_destination_info
 from app.features.accounts.manager import worker_manager, account_manager
 from app.admin.bot import admin_bot
 from app.admin import handlers  # noqa: F401  (ثبت هندلرهای پنل)
+from app.admin import panel_v2  # noqa: F401  (منوهای توزیع و انتشار)
+from app.features.distribution.runtime import distribution
 
 shutdown_event = asyncio.Event()
 
@@ -46,6 +48,10 @@ async def main():
             logger.warning("Destination chat is not set yet. Set it from the admin bot (📤 مقصد ارسال).")
         await admin_bot.start()
         logger.info("Admin bot is running")
+        try:
+            await distribution.start()
+        except Exception as e:     # خطای بخش توزیع نباید جمع‌کننده‌ی اصلی را از کار بیندازد
+            logger.error(f"Distribution failed to start: {type(e).__name__}: {e}", exc_info=True)
 
         started = await account_manager.start_all_active()
         if started == 0:
@@ -63,6 +69,10 @@ async def main():
                 await worker_manager.stop_worker(account_id)
             except Exception as e:
                 logger.warning(f"Error stopping worker {account_id}: {type(e).__name__}")
+        try:
+            await distribution.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping distribution: {type(e).__name__}")
         try:
             if admin_bot.is_initialized:
                 await admin_bot.stop()

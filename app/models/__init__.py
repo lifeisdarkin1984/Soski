@@ -5,6 +5,7 @@ from app.models.flow import FlowJoinChannel
 from app.models.setting import CollectorSetting
 from app.models.delivery import Delivery
 from app.models.log import SystemLog, LogLevel
+from app.models.distribution import ReceiverBot, MediaPost, ForcedChannel, VideoDelivery
 
 __all__ = [
     "Account", "TelegramSession", "AccountStatus",
@@ -13,5 +14,6 @@ __all__ = [
     "FlowJoinChannel",
     "CollectorSetting", 
     "Delivery", 
-    "SystemLog", "LogLevel"
+    "SystemLog", "LogLevel",
+    "ReceiverBot", "MediaPost", "ForcedChannel", "VideoDelivery",
 ]
