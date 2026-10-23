@@ -4,6 +4,7 @@ import logging
 from typing import Optional
 
 from app.features.distribution.botapi import BotApi, BotApiError, BotApiNetworkError
+from app.features.distribution.logic import FlagCache
 from app.features.distribution.poster import PostPublisher
 from app.features.distribution.receiver import DeleteScheduler, ReceiverService
 from app.features.distribution.store import DistStore
@@ -91,8 +92,9 @@ class DistributionRuntime:
         self._apis: dict[int, BotApi] = {}
         self._runners: dict[int, BotRunner] = {}
         self._tasks: list[asyncio.Task] = []
+        self.flags = FlagCache(self.store.get_setting)          # collect_enabled / distribute_enabled
         self.deleter = DeleteScheduler(self.store, self.api_for)
-        self.publisher = PostPublisher(self.store, self.api_for)
+        self.publisher = PostPublisher(self.store, self.api_for, flags=self.flags)
 
     async def api_for(self, bot_pk: int) -> BotApi:
         api = self._apis.get(bot_pk)
@@ -128,7 +130,7 @@ class DistributionRuntime:
             except Exception as e:
                 log.error(f"delete loop error: {type(e).__name__}: {e}")
                 n = 0
-            await asyncio.sleep(1 if n >= 50 else 10)
+            await asyncio.sleep(0.5 if n >= 50 else 2)      # زمان حذف ثانیه‌ای است
 
     async def start(self):
         posts, deliveries = await self.store.reconcile_startup()

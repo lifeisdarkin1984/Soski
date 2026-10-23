@@ -1,5 +1,6 @@
 """دسترسی به دیتابیس برای توزیع (SQLAlchemy). همه‌ی زمان‌ها UTC."""
 import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -117,11 +118,12 @@ class DistStore:
             await db.commit()
 
     # ---------- پست‌های کانال نهایی ----------
-    async def enqueue_post(self, delivery_id: int, storage_chat_id: int, storage_msg_id: int,
+    async def enqueue_post(self, delivery_id: int, storage_chat_id: int, storage_msg_ids: list,
                            caption: str, token: str) -> bool:
         async with AsyncSessionLocal() as db:
             db.add(MediaPost(delivery_id=delivery_id, token=token, storage_chat_id=storage_chat_id,
-                             storage_msg_id=storage_msg_id, caption=caption, status="pending"))
+                             storage_msg_id=storage_msg_ids[0], storage_msg_ids=json.dumps(list(storage_msg_ids)),
+                             caption=caption, status="pending"))
             try:
                 await db.commit()
                 return True

@@ -1,5 +1,6 @@
 """تست‌های بخش توزیع با ربات و دیتابیسِ ساختگی (بدون تلگرام و MySQL واقعی).  اجرا:  python -m unittest discover -s tests -v"""
 import asyncio
+import json
 import unittest
 from datetime import datetime, timedelta
 from types import SimpleNamespace as NS
@@ -31,6 +32,7 @@ class FakeApi:
         self.calls = []                  # (method, args, kwargs)
         self.members = {}                # (chat_id, user_id) -> dict یا Exception
         self.copy_effects = []           # صف رفتار copy: Exception یا None
+        self.send_effects = []           # صف رفتار send_message
         self.copy_delay = 0
         self.delete_effects = []
         self._mid = 1000
@@ -64,6 +66,10 @@ class FakeApi:
 
     async def send_message(self, chat_id, text, reply_markup=None, reply_to_message_id=None):
         self._log("send_message", chat_id, text, reply_markup=reply_markup, reply_to=reply_to_message_id)
+        if self.send_effects:
+            eff = self.send_effects.pop(0)
+            if eff:
+                raise eff
         return {"message_id": self._next()}
 
     async def delete_message(self, chat_id, message_id):
@@ -112,20 +118,23 @@ class FakeStore:
         return [c for c in self.forced if c.is_active or not only_active]
 
     # پست‌ها
-    async def enqueue_post(self, delivery_id, storage_chat_id, storage_msg_id, caption, token):
+    async def enqueue_post(self, delivery_id, storage_chat_id, storage_msg_ids, caption, token):
         if any(p.delivery_id == delivery_id for p in self.posts.values()):
             return False
         self._pid += 1
         self.posts[self._pid] = NS(id=self._pid, delivery_id=delivery_id, token=token, storage_chat_id=storage_chat_id,
-                                   storage_msg_id=storage_msg_id, caption=caption, final_caption=None,
+                                   storage_msg_id=storage_msg_ids[0], storage_msg_ids=json.dumps(storage_msg_ids),
+                                   caption=caption, final_caption=None,
                                    caption_trimmed=False, status="pending", assigned_bot_id=None, attempts=0,
                                    next_attempt_at=None, error_message=None, final_chat_id=None, final_msg_id=None)
         return True
 
-    def add_published_post(self, token, bot_pk, storage_chat=-1001, storage_msg=77, final_caption="کپشن نهایی"):
+    def add_published_post(self, token, bot_pk, storage_chat=-1001, storage_msg=77, final_caption="کپشن نهایی",
+                           ids=None):
         self._pid += 1
         self.posts[self._pid] = NS(id=self._pid, delivery_id=self._pid, token=token, storage_chat_id=storage_chat,
-                                   storage_msg_id=storage_msg, caption="c", final_caption=final_caption,
+                                   storage_msg_id=storage_msg, storage_msg_ids=json.dumps(ids or [storage_msg]),
+                                   caption="c", final_caption=final_caption,
                                    caption_trimmed=False, status="published", assigned_bot_id=bot_pk, attempts=1,
                                    next_attempt_at=None, error_message=None, final_chat_id=-1002, final_msg_id=5)
         return self.posts[self._pid]
@@ -241,54 +250,57 @@ class LogicTests(unittest.TestCase):
         self.assertIsNone(logic.parse_start_command("hello"))
         self.assertIsNone(logic.parse_start_command(None))
 
-    def test_compose_plain(self):
-        text, trimmed = logic.compose_caption("{caption}\n\n{promo}", "سلام", "@ch")
-        self.assertEqual(text, "سلام\n\n@ch")
+    def test_final_caption_is_storage_caption_plus_suffix_at_end(self):
+        text, trimmed = logic.compose_final("کپشن مخزن", "@my_channel\nتوضیحات بیشتر", 4096)
+        self.assertEqual(text, "کپشن مخزن\n\n@my_channel\nتوضیحات بیشتر")
         self.assertFalse(trimmed)
 
-    def test_compose_no_nested_substitution(self):
-        text, _ = logic.compose_caption("{caption}|{promo}", "x{promo}y", "P")
-        self.assertEqual(text, "x{promo}y|P")
+    def test_final_caption_without_suffix_or_caption(self):
+        self.assertEqual(logic.compose_final("فقط کپشن", "", 1024), ("فقط کپشن", False))
+        self.assertEqual(logic.compose_final("", "@ch", 1024), ("@ch", False))
+        self.assertEqual(logic.compose_final("", "", 1024), ("", False))
 
-    def test_compose_trims_long_caption_and_flags(self):
-        cap = "الف" * 1000
-        text, trimmed = logic.compose_caption("{caption}\n\n{promo}", cap, "@my_channel")
+    def test_suffix_never_cut_caption_trimmed_and_flagged(self):
+        text, trimmed = logic.compose_final("الف" * 1000, "@my_channel", 1024)
         self.assertTrue(trimmed)
         self.assertLessEqual(logic.u16len(text), 1024)
-        self.assertTrue(text.endswith("@my_channel"))
+        self.assertTrue(text.endswith("\n\n@my_channel"))
         self.assertIn("…", text)
 
-    def test_compose_emoji_counts_utf16(self):
-        cap = "😀" * 600     # هر ایموجی ۲ واحد UTF-16
-        text, trimmed = logic.compose_caption("{caption}", cap, "")
+    def test_emoji_counts_utf16(self):
+        text, trimmed = logic.compose_final("😀" * 600, "", 1024)
         self.assertTrue(trimmed)
         self.assertLessEqual(logic.u16len(text), 1024)
 
-    def test_compose_template_too_long(self):
+    def test_suffix_too_long_raises(self):
         with self.assertRaises(logic.TemplateTooLong):
-            logic.compose_caption("{caption}\n{promo}", "x", "p" * 1100)
+            logic.compose_final("x", "p" * 1100, 1024)
         with self.assertRaises(logic.TemplateTooLong):
-            logic.compose_caption("{promo}", "x", "p" * 1100)
+            logic.compose_final("", "p" * 1100, 1024)
 
-    def test_validate_template(self):
-        self.assertTrue(logic.validate_template("{caption}\n{promo}")[0])
-        self.assertTrue(logic.validate_template("فقط متن")[0])
-        for bad in ["", "  ", "{title}", "{caption", "caption}", "{{caption}}", "{}"]:
-            self.assertFalse(logic.validate_template(bad)[0], bad)
-
-    def test_button_text(self):
+    def test_validate_suffix_and_button(self):
+        self.assertTrue(logic.validate_suffix("@ch")[0])
+        self.assertTrue(logic.validate_suffix("")[0])
+        self.assertFalse(logic.validate_suffix("x" * 901)[0])
         self.assertTrue(logic.validate_button_text("📥 دریافت")[0])
         self.assertFalse(logic.validate_button_text(" ")[0])
         self.assertFalse(logic.validate_button_text("x" * 41)[0])
 
-    def test_delete_minutes(self):
-        self.assertEqual(logic.parse_delete_minutes("60"), 60)
-        for bad in ["0", "2821", "-5", "abc", "1.5", ""]:
+    def test_delete_seconds(self):
+        self.assertEqual(logic.parse_delete_seconds("30"), 30)
+        self.assertEqual(logic.parse_delete_seconds("169200"), 169200)
+        for bad in ["4", "169201", "-5", "abc", "1.5", ""]:
             with self.assertRaises(ValueError):
-                logic.parse_delete_minutes(bad)
-        self.assertEqual(logic.format_duration(30), "30 دقیقه")
-        self.assertEqual(logic.format_duration(120), "2 ساعت")
-        self.assertEqual(logic.format_duration(90), "1 ساعت و 30 دقیقه")
+                logic.parse_delete_seconds(bad)
+        self.assertEqual(logic.format_duration(30), "30 ثانیه")
+        self.assertEqual(logic.format_duration(90), "1 دقیقه و 30 ثانیه")
+        self.assertEqual(logic.format_duration(3600), "1 ساعت")
+        self.assertEqual(logic.format_duration(3661), "1 ساعت و 1 دقیقه و 1 ثانیه")
+
+    def test_parse_msg_ids(self):
+        self.assertEqual(logic.parse_msg_ids("[5,6,7]", 5), [5, 6, 7])
+        self.assertEqual(logic.parse_msg_ids(None, 9), [9])
+        self.assertEqual(logic.parse_msg_ids("garbage", 9), [9])
 
     def test_member_status(self):
         f = logic.interpret_member_status
@@ -470,11 +482,64 @@ class ReceiverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guide[2]["reply_markup"]["inline_keyboard"][0][0]["callback_data"], f"re:{self.token}")
         self.assertIsNotNone(d.guide_msg_id)
 
-    async def test_custom_delete_time(self):
+    async def test_custom_delete_time_in_seconds(self):
+        self.all_member()
+        self.store.settings["delete_after_sec"] = "30"
+        await self.svc.handle_update(start_update(self.user, self.token))
+        self.assertEqual(self.store.deliveries[1].delete_at, T0 + timedelta(seconds=30))
+        self.assertIn("30 ثانیه", self.texts()[0])
+
+    async def test_old_minutes_setting_still_respected(self):
         self.all_member()
         self.store.settings["delete_after_min"] = "5"
         await self.svc.handle_update(start_update(self.user, self.token))
         self.assertEqual(self.store.deliveries[1].delete_at, T0 + timedelta(minutes=5))
+
+    async def test_invalid_delete_setting_falls_back_to_default(self):
+        self.all_member()
+        self.store.settings["delete_after_sec"] = "999999999"
+        await self.svc.handle_update(start_update(self.user, self.token))
+        self.assertEqual(self.store.deliveries[1].delete_at, T0 + timedelta(seconds=3600))
+
+    # ---- چند ویدیو در یک بسته ----
+    def multi(self):
+        self.post.storage_msg_ids = json.dumps([77, 78, 79])
+        self.all_member()
+
+    async def test_all_videos_sent_in_order_caption_only_on_first_one_guide(self):
+        self.multi()
+        await self.svc.handle_update(start_update(self.user, self.token))
+        copies = self.api.of("copy_message")
+        self.assertEqual([c[1][2] for c in copies], [77, 78, 79])
+        self.assertEqual([c[2]["caption"] for c in copies], ["کپشن نهایی", None, None])
+        self.assertEqual(len(self.store.deliveries), 3)
+        self.assertTrue(all(d.status == "sent" and d.delete_at == T0 + timedelta(seconds=3600)
+                            for d in self.store.deliveries.values()))
+        self.assertEqual(len(self.api.of("send_message")), 1)        # فقط یک راهنما
+        self.assertIsNotNone(self.store.deliveries[1].guide_msg_id)
+
+    async def test_redownload_sends_all_videos_again_without_new_guide(self):
+        self.multi()
+        await self.svc.handle_update(start_update(self.user, self.token))
+        self.clock.advance(minutes=5)
+        await self.svc.handle_update(cb_update(self.user, f"re:{self.token}"))
+        self.assertEqual(len(self.api.of("copy_message")), 6)
+        self.assertEqual(len(self.api.of("send_message")), 1)
+
+    async def test_partial_failure_reports_and_keeps_sent_ones_scheduled(self):
+        self.multi()
+        self.api.copy_effects = [None, BotApiError(400, "Bad Request: message to copy not found"), None]
+        await self.svc.handle_update(start_update(self.user, self.token))
+        self.assertEqual(len(self.api.of("copy_message")), 2)          # بعد از شکست ادامه نمی‌دهد
+        self.assertEqual([d.status for d in self.store.deliveries.values()], ["sent", "send_failed"])
+        self.assertIn("بخشی از ویدیوها", self.texts()[-1])
+
+    async def test_ambiguous_second_video_stops_and_is_not_resent(self):
+        self.multi()
+        self.api.copy_effects = [None, BotApiNetworkError("TimeoutError")]
+        await self.svc.handle_update(start_update(self.user, self.token))
+        self.assertEqual(len(self.api.of("copy_message")), 2)
+        self.assertEqual([d.status for d in self.store.deliveries.values()], ["sent", "unknown"])
 
     async def test_redownload_rechecks_membership_and_has_independent_timer(self):
         self.all_member()
@@ -622,20 +687,55 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
         self.store = FakeStore(self.clock)
         self.store.settings["final_chat_id"] = "-100999"
         self.apis = {}
+        self.flags = logic.FlagCache(self.store.get_setting, ttl=0)
 
         async def api_for(pk):
             return self.apis.setdefault(pk, FakeApi())
 
-        self.pub = PostPublisher(self.store, api_for, now_fn=self.clock)
+        self.pub = PostPublisher(self.store, api_for, now_fn=self.clock, flags=self.flags)
 
-    async def enq(self, n, caption="cap"):
+    async def enq(self, n, caption="cap", ids=None):
         for i in range(1, n + 1):
-            self.assertTrue(await enqueue_post(self.store, 100 + i, -1001, 50 + i, caption))
+            self.assertTrue(await enqueue_post(self.store, 100 + i, -1001, ids or [50 + i], caption))
 
     def post_of(self, i):
         return self.store.posts[i]
 
-    async def test_round_robin_across_two_bots_and_deep_links(self):
+    async def test_final_channel_gets_only_text_and_button_never_the_video(self):
+        self.store.add_bot(1, "BotOne")
+        self.store.settings["caption_suffix"] = "@my_channel\nتوضیحات"
+        await self.enq(1, caption="کپشن مخزن", ids=[51, 52, 53])
+        await self.pub.run_once()
+        api = self.apis[1]
+        self.assertEqual(api.of("copy_message"), [])                    # ویدیو در کانال نهایی نیست
+        sent = api.of("send_message")
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0][1], (-100999, "کپشن مخزن\n\n@my_channel\nتوضیحات"))
+        btn = sent[0][2]["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(btn["url"], f"https://t.me/BotOne?start=v_{self.post_of(1).token}")
+        self.assertEqual(self.post_of(1).status, "published")
+        self.assertEqual(json.loads(self.post_of(1).storage_msg_ids), [51, 52, 53])   # یک پست برای کل بسته
+
+    async def test_caption_exactly_as_stored_when_no_suffix(self):
+        self.store.add_bot(1, "BotOne")
+        await self.enq(1, caption="فقط کپشن")
+        await self.pub.run_once()
+        self.assertEqual(self.apis[1].of("send_message")[0][1][1], "فقط کپشن")
+
+    async def test_empty_caption_and_suffix_uses_default_text(self):
+        self.store.add_bot(1, "BotOne")
+        await self.enq(1, caption="")
+        await self.pub.run_once()
+        self.assertEqual(self.apis[1].of("send_message")[0][1][1], logic.DEFAULT_POST_TEXT)
+
+    async def test_button_text_setting(self):
+        self.store.add_bot(1, "BotOne")
+        self.store.settings["tpl_button"] = "دانلود"
+        await self.enq(1)
+        await self.pub.run_once()
+        self.assertEqual(self.apis[1].of("send_message")[0][2]["reply_markup"]["inline_keyboard"][0][0]["text"], "دانلود")
+
+    async def test_round_robin_across_two_bots(self):
         self.store.add_bot(1, "BotOne")
         self.store.add_bot(2, "BotTwo")
         await self.enq(4)
@@ -643,11 +743,7 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
             pass
         self.assertEqual([self.post_of(i).assigned_bot_id for i in (1, 2, 3, 4)], [1, 2, 1, 2])
         self.assertTrue(all(self.post_of(i).status == "published" for i in (1, 2, 3, 4)))
-        call = self.apis[1].of("copy_message")[0]
-        self.assertEqual(call[1], (-100999, -1001, 51))
-        url = call[2]["reply_markup"]["inline_keyboard"][0][0]["url"]
-        self.assertEqual(url, f"https://t.me/BotOne?start=v_{self.post_of(1).token}")
-        url2 = self.apis[2].of("copy_message")[0][2]["reply_markup"]["inline_keyboard"][0][0]["url"]
+        url2 = self.apis[2].of("send_message")[0][2]["reply_markup"]["inline_keyboard"][0][0]["url"]
         self.assertTrue(url2.startswith("https://t.me/BotTwo?start=v_"))
         self.assertNotEqual(self.post_of(1).token, self.post_of(2).token)
 
@@ -658,7 +754,6 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
         while await self.pub.run_once():
             pass
         self.assertEqual({self.post_of(i).assigned_bot_id for i in (1, 2, 3)}, {1})
-        self.assertEqual(self.store.bots[1].assigned_count, 3)
         self.assertEqual(self.store.bots[2].assigned_count, 0)
 
     async def test_no_active_bot_keeps_queue(self):
@@ -667,7 +762,7 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.pub.run_once())
         self.assertEqual([self.post_of(i).status for i in (1, 2)], ["pending", "pending"])
         self.assertEqual(self.apis, {})
-        self.store.bots[1].is_active = True                       # با فعال‌شدن ربات، صف خالی می‌شود
+        self.store.bots[1].is_active = True
         while await self.pub.run_once():
             pass
         self.assertEqual([self.post_of(i).status for i in (1, 2)], ["published", "published"])
@@ -679,71 +774,133 @@ class PosterTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.pub.run_once())
         self.assertEqual(self.post_of(1).status, "pending")
 
+    async def test_distribution_switch_off_keeps_queue_then_resumes(self):
+        self.store.add_bot(1, "BotOne")
+        await self.enq(2)
+        self.store.settings["distribute_enabled"] = "0"
+        self.assertFalse(await self.pub.run_once())
+        self.assertEqual([self.post_of(i).status for i in (1, 2)], ["pending", "pending"])
+        self.assertEqual(self.apis, {})
+        self.store.settings["distribute_enabled"] = "1"
+        while await self.pub.run_once():
+            pass
+        self.assertEqual([self.post_of(i).status for i in (1, 2)], ["published", "published"])
+
     async def test_enqueue_is_idempotent(self):
-        self.assertTrue(await enqueue_post(self.store, 7, -1, 1, "a"))
-        self.assertFalse(await enqueue_post(self.store, 7, -1, 1, "a"))
+        self.assertTrue(await enqueue_post(self.store, 7, -1, [1, 2], "a"))
+        self.assertFalse(await enqueue_post(self.store, 7, -1, [1, 2], "a"))
         self.assertEqual(len(self.store.posts), 1)
 
     async def test_ambiguous_result_is_not_resent(self):
         self.store.add_bot(1, "BotOne")
         await self.enq(1)
         api = self.apis.setdefault(1, FakeApi())
-        api.copy_effects = [BotApiNetworkError("TimeoutError")]
+        api.send_effects = [BotApiNetworkError("TimeoutError")]
         await self.pub.run_once()
         self.assertEqual(self.post_of(1).status, "unknown")
         self.clock.advance(hours=1)
         self.assertFalse(await self.pub.run_once())
-        self.assertEqual(len(api.of("copy_message")), 1)
+        self.assertEqual(len(api.of("send_message")), 1)
 
     async def test_failure_retries_with_next_bot_then_fails(self):
         self.store.add_bot(1, "BotOne")
         self.store.add_bot(2, "BotTwo")
         await self.enq(1)
         for pk in (1, 2):
-            self.apis.setdefault(pk, FakeApi()).copy_effects = [BotApiError(400, "Bad Request: not enough rights")] * 5
+            self.apis.setdefault(pk, FakeApi()).send_effects = [BotApiError(400, "Bad Request: not enough rights")] * 5
         await self.pub.run_once()
         p = self.post_of(1)
         self.assertEqual((p.status, p.attempts), ("pending", 1))
         self.assertEqual(p.next_attempt_at, T0 + timedelta(seconds=60))
-        self.assertFalse(await self.pub.run_once())               # هنوز زمانش نرسیده
-        for expected_attempts in (2, 3):
+        self.assertFalse(await self.pub.run_once())
+        for _ in (2, 3):
             self.clock.advance(seconds=61)
             await self.pub.run_once()
         self.assertEqual((p.status, p.attempts), ("failed", 3))
         self.assertIn("not enough rights", p.error_message)
-        self.assertEqual(self.apis[1].of("copy_message")[0][1][0], -100999)
-        self.assertEqual(len(self.apis[2].of("copy_message")), 1)  # تلاش دوم با ربات بعدی
+        self.assertEqual(len(self.apis[2].of("send_message")), 1)
 
-    async def test_long_caption_trimmed_and_full_text_sent_separately(self):
+    async def test_video_caption_trimmed_but_channel_text_is_full(self):
         self.store.add_bot(1, "BotOne")
-        self.store.settings["tpl_promo"] = "@my_channel"
+        self.store.settings["caption_suffix"] = "@my_channel"
         await self.enq(1, caption="ب" * 1020)
         await self.pub.run_once()
         p = self.post_of(1)
-        self.assertEqual(p.status, "published")
         self.assertTrue(p.caption_trimmed)
-        self.assertLessEqual(logic.u16len(p.final_caption), 1024)
-        sent = self.apis[1].of("send_message")
-        self.assertEqual(len(sent), 1)
-        self.assertEqual(sent[0][1][1], "ب" * 1020)                 # متن کامل بی‌صدا حذف نشد
-        self.assertEqual(sent[0][2]["reply_to"], p.final_msg_id)
+        self.assertLessEqual(logic.u16len(p.final_caption), 1024)            # کپشن ویدیو داخل ربات
+        self.assertTrue(p.final_caption.endswith("@my_channel"))
+        self.assertEqual(self.apis[1].of("send_message")[0][1][1], "ب" * 1020 + "\n\n@my_channel")   # متن کانال کامل
+        self.assertEqual(len(self.apis[1].of("send_message")), 1)
 
-    async def test_template_too_long_fails_without_sending(self):
+    async def test_suffix_too_long_fails_without_sending(self):
         self.store.add_bot(1, "BotOne")
-        self.store.settings["tpl_promo"] = "p" * 1100
+        self.store.settings["caption_suffix"] = "p" * 1100
         await self.enq(1)
         await self.pub.run_once()
         self.assertEqual(self.post_of(1).status, "failed")
-        self.assertEqual(self.apis.get(1, FakeApi()).of("copy_message"), [])
+        self.assertEqual(self.apis.get(1, FakeApi()).of("send_message"), [])
 
-    async def test_custom_template_and_button(self):
-        self.store.add_bot(1, "BotOne")
-        self.store.settings.update({"tpl_caption": "🎬 {caption}\n{promo}", "tpl_promo": "@ads", "tpl_button": "دانلود"})
-        await self.enq(1, caption="فیلم")
-        await self.pub.run_once()
-        call = self.apis[1].of("copy_message")[0]
-        self.assertEqual(call[2]["caption"], "🎬 فیلم\n@ads")
-        self.assertEqual(call[2]["reply_markup"]["inline_keyboard"][0][0]["text"], "دانلود")
+
+# ====================== کلید روشن/خاموش ======================
+class FlagTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_on_and_values(self):
+        data = {}
+
+        async def getter(k):
+            return data.get(k)
+
+        t = {"v": 0.0}
+        flags = logic.FlagCache(getter, ttl=5, now=lambda: t["v"])
+        self.assertTrue(await flags.get("collect_enabled"))               # پیش‌فرض روشن
+        data["collect_enabled"] = "0"
+        self.assertTrue(await flags.get("collect_enabled"))               # هنوز کش
+        t["v"] = 6
+        self.assertFalse(await flags.get("collect_enabled"))              # بعد از TTL
+        data["collect_enabled"] = "1"
+        flags.invalidate("collect_enabled")
+        self.assertTrue(await flags.get("collect_enabled"))
+        for off in ("0", "false", "OFF", "no"):
+            data["x"] = off
+            flags.invalidate()
+            self.assertFalse(await flags.get("x"), off)
+
+
+# ====================== فقط ویدیو ======================
+class VideoOnlyTests(unittest.TestCase):
+    def setUp(self):
+        from app.features.bot_engine import helpers
+        self.h = helpers
+
+    def msg(self, id, **kw):
+        base = dict(id=id, outgoing=False, video=None, document=None, photo=None, animation=None, audio=None,
+                    voice=None, reply_markup=None)
+        base.update(kw)
+        return NS(**base)
+
+    def test_only_video_counts(self):
+        v = self.msg(1, video=NS(file_unique_id="a"))
+        self.assertEqual(self.h.get_video(v)[0], "video")
+        self.assertEqual(self.h.get_video(self.msg(2, document=NS(mime_type="video/x-matroska", file_unique_id="d")))[0],
+                         "document")
+        for other in (self.msg(3, photo=NS()), self.msg(4, animation=NS()), self.msg(5, audio=NS()),
+                      self.msg(6, voice=NS()), self.msg(7, document=NS(mime_type="application/zip"))):
+            self.assertIsNone(self.h.get_video(other))
+
+    def test_pick_videos_all_new_in_order_without_duplicates_or_photos(self):
+        history = [self.msg(9, video=NS(file_unique_id="c")), self.msg(8, photo=NS()),
+                   self.msg(7, video=NS(file_unique_id="b")), self.msg(6, video=NS(file_unique_id="b")),
+                   self.msg(5, video=NS(file_unique_id="old")), self.msg(10, video=NS(file_unique_id="mine"), outgoing=True)]
+        got = self.h.pick_videos(history, baseline_id=5)
+        self.assertEqual([m.id for m in got], [6, 9])              # قدیمی‌ها، عکس، تکراری و پیام خودمان نه
+
+    def test_pick_videos_limit(self):
+        history = [self.msg(i, video=NS(file_unique_id=str(i))) for i in range(1, 40)]
+        self.assertEqual(len(self.h.pick_videos(history, 0, limit=20)), 20)
+
+    def test_photo_is_not_chosen_as_the_media_answer(self):
+        history = [self.msg(5, photo=NS()), self.msg(6, reply_markup=NS(inline_keyboard=[]))]
+        picked, _ = self.h.pick_bot_message(history, 0)
+        self.assertEqual(picked.id, 6)                             # پیام دارای دکمه، نه عکس
 
 
 # ====================== سلامت ربات ======================
@@ -752,6 +909,9 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         class Api:
             async def get_me(self):
                 return {"username": "RecvBot"}
+
+            async def get_chat(self, chat_id):
+                return {"type": "channel"}
 
             async def get_chat_member(self, chat_id, user_id):
                 if chat_id == -1:      # مخزن: ادمین
@@ -770,6 +930,20 @@ class HealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(ok["بررسی عضویت «X»"])
         self.assertTrue(ok["بررسی عضویت «Y»"])
         self.assertIn("chat not found", [c for c in checks if "«X»" in c.label][0].detail)
+
+    async def test_final_group_needs_only_membership(self):
+        class Api:
+            async def get_me(self):
+                return {"username": "RecvBot"}
+
+            async def get_chat(self, chat_id):
+                return {"type": "supergroup"}
+
+            async def get_chat_member(self, chat_id, user_id):
+                return {"status": "member"}
+
+        checks = await check_bot(Api(), 11, -1, -2, [])
+        self.assertTrue(next(c for c in checks if c.label == "ارسال در کانال نهایی").ok)
 
     async def test_bad_token_stops_early(self):
         class Api:

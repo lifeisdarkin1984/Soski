@@ -9,7 +9,7 @@ from app.core.database import AsyncSessionLocal
 from app.repositories.flow_repository import FlowRepository
 from app.repositories.settings_repository import get_destination_id
 from app.features.processor.caption_cleaner import caption_cleaner
-from app.features.bot_engine.helpers import get_media
+from app.features.bot_engine.helpers import get_video
 
 # خطاهایی که نتیجه‌ی ارسال را «نامشخص» می‌کنند (ممکن است پیام رفته باشد)
 AMBIGUOUS_ERRORS = (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)
@@ -58,17 +58,21 @@ class Publisher:
                     pass
 
     @staticmethod
-    async def publish_media(client: Client, bot_media_msg: Message, source_channel_id: int, source_msg_id: int,
+    async def publish_media(client: Client, bot_media_msgs, source_channel_id: int, source_msg_id: int,
                             account_id: int, target_bot_username: str, joined_channels_count: int,
                             processed_msg_id: int) -> bool:
-        found = get_media(bot_media_msg)
+        """همه‌ی ویدیوهای یک پست را در مخزن ذخیره می‌کند (کپشن فقط روی اولین ویدیوی تازه) و یک «بسته» برای
+        انتشار در کانال نهایی صف می‌کند. ویدیوی تکراری (قبلاً ذخیره‌شده) رد می‌شود."""
+        videos = []
+        for m in (bot_media_msgs or []):
+            found = get_video(m)
+            if found:
+                videos.append((m, found[0], found[1]))
         async with AsyncSessionLocal() as db:
             flow_repo = FlowRepository(db)
-            if not found:
-                await flow_repo.mark_message_failed(processed_msg_id, "Bot message has no media")
+            if not videos:
+                await flow_repo.mark_message_failed(processed_msg_id, "Bot message has no video")
                 return False
-            kind, media_obj = found
-            file_id, file_unique_id = media_obj.file_id, media_obj.file_unique_id
 
             # کپشن از پست اصلی کانال (نه از پیام ربات)
             try:
@@ -80,64 +84,71 @@ class Publisher:
                 text, entities = "", []
             caption = caption_cleaner.clean(text, entities)
 
-            outcome, delivery_id = await flow_repo.claim_delivery({
-                'source_channel_id': source_channel_id, 'source_msg_id': source_msg_id,
-                'account_id': account_id, 'target_bot_username': target_bot_username,
-                'joined_channels_count': joined_channels_count, 'file_id': file_id,
-                'file_unique_id': file_unique_id,
-            })
-            if outcome != "claimed":
-                if outcome == "busy":
-                    logger.warning(f"File {file_unique_id} is being sent or in unknown state; skipping resend.")
-                await flow_repo.mark_message_completed(processed_msg_id)
-                return True
-
             destination = await get_destination_id()
             if destination is None:
-                await flow_repo.release_delivery(delivery_id)
                 await flow_repo.mark_message_failed(processed_msg_id, "Destination chat is not set")
                 return False
-            sent = None
-            try:
-                try:
-                    sent = await Publisher._send_cached(client, destination, kind, file_id, caption)
-                except AMBIGUOUS_ERRORS:
-                    raise
-                except Exception as e:
-                    logger.info(f"Cached send failed ({type(e).__name__}); falling back to download+upload")
-                    sent = await Publisher._send_uploaded(client, destination, bot_media_msg, kind,
-                                                          file_unique_id, caption)
-            except AMBIGUOUS_ERRORS as e:
-                # شاید پیام رفته باشد؛ دوباره نمی‌فرستیم
-                await flow_repo.mark_delivery_unknown(delivery_id)
-                await flow_repo.mark_message_failed(
-                    processed_msg_id, f"Send result unknown ({type(e).__name__}); not resent automatically")
-                logger.error(f"Ambiguous send result for {file_unique_id}: {type(e).__name__}")
-                return False
-            except Exception as e:
-                await flow_repo.release_delivery(delivery_id)
-                await flow_repo.mark_message_failed(processed_msg_id, f"Publish error: {type(e).__name__}: {e}")
-                logger.error(f"Publish failed: {type(e).__name__}: {e}", exc_info=True)
-                return False
 
-            sent_msg = sent[0] if isinstance(sent, list) else sent
-            sent_id = getattr(sent_msg, "id", None)
-            when = getattr(sent_msg, "date", None)
-            report = (
-                f"Status: Success | Source: {source_channel_id} (msg {source_msg_id}) | Account: {account_id} | "
-                f"Bot: {target_bot_username} | Joined: {joined_channels_count} | "
-                f"Time: {when.strftime('%Y-%m-%d %H:%M:%S') if when else '-'}"
-            )
-            await flow_repo.mark_delivery_sent(delivery_id, sent_id, report)
-            await flow_repo.mark_message_completed(processed_msg_id)
-            # ذخیره در مخزن موفق بود ← پست برای انتشار در کانال نهایی صف می‌شود (تکراری بی‌اثر است)
-            if sent_id:
+            stored: list[tuple[int, int]] = []       # (delivery_id, پیام مخزن)
+            failure = None
+            for bot_media_msg, kind, media_obj in videos:
+                file_id, file_unique_id = media_obj.file_id, media_obj.file_unique_id
+                outcome, delivery_id = await flow_repo.claim_delivery({
+                    'source_channel_id': source_channel_id, 'source_msg_id': source_msg_id,
+                    'account_id': account_id, 'target_bot_username': target_bot_username,
+                    'joined_channels_count': joined_channels_count, 'file_id': file_id,
+                    'file_unique_id': file_unique_id,
+                })
+                if outcome != "claimed":
+                    if outcome == "busy":
+                        logger.warning(f"File {file_unique_id} is being sent or in unknown state; skipping resend.")
+                    continue
+                cap = caption if not stored else ""
+                try:
+                    try:
+                        sent = await Publisher._send_cached(client, destination, kind, file_id, cap)
+                    except AMBIGUOUS_ERRORS:
+                        raise
+                    except Exception as e:
+                        logger.info(f"Cached send failed ({type(e).__name__}); falling back to download+upload")
+                        sent = await Publisher._send_uploaded(client, destination, bot_media_msg, kind,
+                                                              file_unique_id, cap)
+                except AMBIGUOUS_ERRORS as e:
+                    # شاید پیام رفته باشد؛ دوباره نمی‌فرستیم
+                    await flow_repo.mark_delivery_unknown(delivery_id)
+                    failure = f"Send result unknown ({type(e).__name__}); not resent automatically"
+                    logger.error(f"Ambiguous send result for {file_unique_id}: {type(e).__name__}")
+                    break
+                except Exception as e:
+                    await flow_repo.release_delivery(delivery_id)
+                    failure = f"Publish error: {type(e).__name__}: {e}"
+                    logger.error(f"Publish failed: {type(e).__name__}: {e}", exc_info=True)
+                    break
+
+                sent_msg = sent[0] if isinstance(sent, list) else sent
+                sent_id = getattr(sent_msg, "id", None)
+                when = getattr(sent_msg, "date", None)
+                report = (
+                    f"Status: Success | Source: {source_channel_id} (msg {source_msg_id}) | Account: {account_id} | "
+                    f"Bot: {target_bot_username} | Joined: {joined_channels_count} | "
+                    f"Time: {when.strftime('%Y-%m-%d %H:%M:%S') if when else '-'}"
+                )
+                await flow_repo.mark_delivery_sent(delivery_id, sent_id, report)
+                if sent_id:
+                    stored.append((delivery_id, int(sent_id)))
+
+            # ذخیره در مخزن (حتی ناقص) ← بسته برای کانال نهایی صف می‌شود؛ تکراری بی‌اثر است
+            if stored:
                 try:
                     from app.features.distribution.runtime import distribution
                     from app.features.distribution.poster import enqueue_post
-                    await enqueue_post(distribution.store, delivery_id, destination, int(sent_id), caption)
+                    await enqueue_post(distribution.store, stored[0][0], destination, [i for _, i in stored], caption)
                 except Exception as e:
-                    logger.error(f"Could not queue final post for delivery {delivery_id}: {type(e).__name__}: {e}")
+                    logger.error(f"Could not queue final post for delivery {stored[0][0]}: {type(e).__name__}: {e}")
+            if failure:
+                await flow_repo.mark_message_failed(processed_msg_id, failure)
+                return False
+            await flow_repo.mark_message_completed(processed_msg_id)
             return True
 
 

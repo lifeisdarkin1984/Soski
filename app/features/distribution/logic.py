@@ -1,12 +1,11 @@
 """منطق خالصِ توزیع (بدون تلگرام و دیتابیس)؛ کاملاً قابل تست.
 
-قالب کپشن (نحو):
-  {caption}  = کپشن تمیزشده‌ی پست اصلی
-  {promo}    = متن تبلیغاتی تنظیم‌شده در ربات مدیریت
-  فقط همین دو متغیر مجازند؛ هر { یا } دیگر خطاست.
+کپشن نهایی = همان کپشنِ ذخیره‌شده در مخزن + (دو خط فاصله) + «متن انتهای کپشن» که از پنل تنظیم می‌شود.
 """
+import json
 import re
 import secrets
+import time
 from collections import namedtuple
 from datetime import datetime, timezone
 from typing import Any, Iterable, Optional, Sequence
@@ -17,12 +16,14 @@ _TOKEN_CORE = r"[A-Za-z0-9_-]{16}"
 PAYLOAD_RE = re.compile(rf"^{PAYLOAD_PREFIX}({_TOKEN_CORE})$")
 TOKEN_RE = re.compile(rf"^{_TOKEN_CORE}$")
 
-ALLOWED_PLACEHOLDERS = ("caption", "promo")
-DEFAULT_TPL_CAPTION = "{caption}\n\n{promo}"
 DEFAULT_TPL_BUTTON = "📥 دریافت ویدیو"
-DEFAULT_DELETE_MINUTES = 60
-MIN_DELETE_MINUTES = 1
-MAX_DELETE_MINUTES = 47 * 60      # تلگرام حذف پیام‌های قدیمی‌تر از ۴۸ ساعت را قبول نمی‌کند
+DEFAULT_POST_TEXT = "🎬 ویدیوی جدید"       # اگر نه کپشن باشد نه متن انتهایی (پیام متنیِ خالی ممکن نیست)
+POST_TEXT_LIMIT = 4096                     # پیام متنی کانال نهایی
+VIDEO_CAPTION_LIMIT = 1024                 # کپشن ویدیو داخل ربات
+MAX_SUFFIX_LEN = 900
+DEFAULT_DELETE_SECONDS = 3600
+MIN_DELETE_SECONDS = 5
+MAX_DELETE_SECONDS = 47 * 3600             # تلگرام حذف پیام‌های قدیمی‌تر از ۴۸ ساعت را قبول نمی‌کند
 MAX_BUTTON_TEXT = 40
 
 
@@ -77,16 +78,9 @@ def trim_u16(s: str, n: int) -> str:
     return s.encode("utf-16-le")[: n * 2].decode("utf-16-le", errors="ignore")
 
 
-def validate_template(tpl: str) -> tuple[bool, str]:
-    if not (tpl or "").strip():
-        return False, "قالب خالی است."
-    tokens = re.findall(r"\{([^{}]*)\}", tpl)
-    bad = [t for t in tokens if t not in ALLOWED_PLACEHOLDERS]
-    if bad:
-        return False, "متغیر نامعتبر: " + ", ".join("{" + b + "}" for b in bad) + "\nفقط {caption} و {promo} مجازند."
-    leftover = re.sub(r"\{[^{}]*\}", "", tpl)
-    if "{" in leftover or "}" in leftover:
-        return False, "آکولاد ناقص است؛ فقط {caption} و {promo} مجازند."
+def validate_suffix(text: str) -> tuple[bool, str]:
+    if u16len(text or "") > MAX_SUFFIX_LEN:
+        return False, f"متن انتهایی حداکثر {MAX_SUFFIX_LEN} نویسه باشد."
     return True, ""
 
 
@@ -99,47 +93,70 @@ def validate_button_text(text: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _render(template: str, caption: str, promo: str) -> str:
-    values = {"caption": caption, "promo": promo}
-    return re.sub(r"\{(caption|promo)\}", lambda m: values[m.group(1)], template)   # یک‌مرحله‌ای؛ جایگزینی تو در تو ندارد
-
-
-def compose_caption(template: str, caption: Optional[str], promo: Optional[str],
-                    limit: int = CAPTION_LIMIT) -> tuple[str, bool]:
-    """(کپشن نهایی، آیا کپشن اصلی کوتاه شد). اگر قالب به‌تنهایی از حد بیشتر باشد TemplateTooLong."""
-    caption, promo = caption or "", promo or ""
-    full = _render(template, caption, promo)
-    if u16len(full) <= limit:
-        return full, False
-    n = template.count("{caption}")
-    fixed = _render(template, "", promo)
-    if n == 0 or u16len(fixed) >= limit:
-        raise TemplateTooLong("قالب و متن تبلیغاتی به‌تنهایی از حد مجاز کپشن (۱۰۲۴) بلندترند.")
-    budget = (limit - u16len(fixed)) // n
-    if budget < 10:
-        raise TemplateTooLong("برای کپشن اصلی جای کافی باقی نمی‌ماند؛ قالب یا متن تبلیغاتی را کوتاه کنید.")
+def compose_final(caption: Optional[str], suffix: Optional[str], limit: int) -> tuple[str, bool]:
+    """(متن نهایی، آیا کپشن اصلی برای جاشدن کوتاه شد). متن انتهایی هیچ‌وقت بریده نمی‌شود."""
+    caption, suffix = (caption or "").strip(), (suffix or "").strip()
+    text = f"{caption}\n\n{suffix}" if caption and suffix else (caption or suffix)
+    if u16len(text) <= limit:
+        return text, False
+    budget = limit - (u16len(suffix) + 2 if suffix else 0)
+    if not caption or budget < 10:
+        raise TemplateTooLong("متن انتهایی به‌تنهایی از حد مجاز بلندتر است؛ کوتاهش کنید.")
     cut = trim_u16(caption, budget - 1).rstrip() + "…"
-    return _render(template, cut, promo), True
+    return (f"{cut}\n\n{suffix}" if suffix else cut), True
+
+
+def parse_msg_ids(storage_msg_ids: Optional[str], first_id: int) -> list[int]:
+    """شناسه‌ی پیام‌های ویدیو در مخزن (به ترتیب)."""
+    try:
+        ids = [int(i) for i in json.loads(storage_msg_ids or "[]")]
+    except (ValueError, TypeError):
+        ids = []
+    return ids or [int(first_id)]
+
+
+class FlagCache:
+    """کلید خاموش/روشن با کش کوتاه (برای اینکه با هر پست به دیتابیس نرویم)."""
+    def __init__(self, getter, ttl: float = 5.0, now=time.monotonic):
+        self._getter, self._ttl, self._now = getter, ttl, now
+        self._cache: dict[str, tuple[float, bool]] = {}
+
+    async def get(self, key: str, default: bool = True) -> bool:
+        hit = self._cache.get(key)
+        if hit and self._now() - hit[0] < self._ttl:
+            return hit[1]
+        raw = await self._getter(key)
+        value = default if raw is None else str(raw).strip().lower() not in ("0", "false", "off", "no")
+        self._cache[key] = (self._now(), value)
+        return value
+
+    def invalidate(self, key: Optional[str] = None):
+        self._cache.pop(key, None) if key else self._cache.clear()
 
 
 # ---------- زمان حذف ----------
-def parse_delete_minutes(text: Any) -> int:
+def parse_delete_seconds(text: Any) -> int:
     t = str(text).strip()
     if not t.isdigit():
-        raise ValueError("فقط عدد (دقیقه) بفرستید.")
+        raise ValueError("فقط عدد (ثانیه) بفرستید.")
     v = int(t)
-    if not (MIN_DELETE_MINUTES <= v <= MAX_DELETE_MINUTES):
-        raise ValueError(f"عدد باید بین {MIN_DELETE_MINUTES} تا {MAX_DELETE_MINUTES} دقیقه (کمتر از ۴۸ ساعت) باشد.")
+    if not (MIN_DELETE_SECONDS <= v <= MAX_DELETE_SECONDS):
+        raise ValueError(f"عدد باید بین {MIN_DELETE_SECONDS} تا {MAX_DELETE_SECONDS} ثانیه (کمتر از ۴۸ ساعت) باشد.")
     return v
 
 
-def format_duration(minutes: int) -> str:
-    h, m = divmod(int(minutes), 60)
-    if h == 0:
-        return f"{m} دقیقه"
-    if m == 0:
-        return f"{h} ساعت"
-    return f"{h} ساعت و {m} دقیقه"
+def format_duration(seconds: int) -> str:
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, sec = divmod(rem, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} ساعت")
+    if m:
+        parts.append(f"{m} دقیقه")
+    if sec or not parts:
+        parts.append(f"{sec} ثانیه")
+    return " و ".join(parts)
 
 
 # ---------- عضویت ----------

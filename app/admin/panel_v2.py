@@ -12,7 +12,8 @@ from app.admin.handlers import admin_only, kb, _edit, login_states
 from app.core.config import settings
 from app.core.crypto import crypto
 from app.core.logger import logger
-from app.features.bot_engine.helpers import parse_destination_input
+from app.features.accounts.manager import worker_manager
+from app.features.bot_engine.helpers import parse_destination_input, unwrap_chat
 from app.features.distribution import logic
 from app.features.distribution.botapi import BotApi, BotApiError, BotApiNetworkError
 from app.features.distribution.health import check_bot
@@ -67,24 +68,60 @@ async def v2_cancel(client: Client, message: Message):
 
 
 async def _resolve_chat(message: Message):
-    """(chat_id, title, username) از فوروارد، آیدی عددی یا @یوزرنیم. در شکست (None, None, None)."""
+    """(chat_id, title, username, error). از فوروارد، آیدی عددی یا @یوزرنیم.
+    آیدی عددی بدون getChat پذیرفته می‌شود؛ خطای واقعی بعداً از پیام آزمایشی دیده می‌شود."""
     chat = getattr(message, "forward_from_chat", None)
     origin = getattr(message, "forward_origin", None)
     if chat is None and origin is not None:
         chat = getattr(origin, "chat", None)
     if chat is not None:
-        return chat.id, getattr(chat, "title", None), getattr(chat, "username", None)
+        return chat.id, getattr(chat, "title", None), getattr(chat, "username", None), None
     target = parse_destination_input(message.text)
-    if target is None or (isinstance(target, str) and target.startswith("http")):
-        return None, None, None
+    if target is None:
+        return None, None, None, "ورودی قابل فهم نیست."
+    if isinstance(target, str) and target.startswith("http"):
+        return await _resolve_invite(target)
+    if isinstance(target, int):
+        return target, None, None, None
     api = await _any_api()
     if api is None:
-        return None, None, None
+        return None, None, None, "اول یک ربات دریافت اضافه کنید."
     try:
-        info = await api.get_chat(target if isinstance(target, int) else f"@{target}")
+        info = await api.get_chat(f"@{target}")
+    except BotApiError as e:
+        return None, None, None, f"تلگرام: {e.code} {e.description}"
+    except BotApiNetworkError:
+        return None, None, None, "اتصال به تلگرام برقرار نشد."
+    return info["id"], info.get("title"), info.get("username"), None
+
+
+async def _resolve_invite(link: str):
+    """ربات‌ها با لینک دعوت وارد چت نمی‌شوند؛ اکانت جمع‌کننده با لینک عضو می‌شود و آیدی چت را پیدا می‌کند.
+    (ربات دریافت را بعدش باید خودتان در آن چت اضافه کنید.)"""
+    workers = [w for w in worker_manager.workers.values() if getattr(w, "is_running", False)]
+    if not workers:
+        return None, None, None, "برای لینک دعوت باید حداقل یک اکانت جمع‌کننده روشن باشد؛ یا آیدی عددی/فوروارد بفرستید."
+    client = workers[0].client
+    try:
+        chat = await client.get_chat(link)
+        if not getattr(chat, "id", None):          # اکانت هنوز عضو نیست
+            joined = await client.join_chat(link)
+            chat = unwrap_chat(joined) or await client.get_chat(link)
+            if not getattr(chat, "id", None):
+                return None, None, None, "درخواست عضویت ثبت شد ولی هنوز تأیید نشده؛ بعد از تأیید دوباره بفرستید."
+    except Exception as e:
+        logger.warning(f"invite resolve failed: {type(e).__name__}: {e}")
+        return None, None, None, f"اکانت نتوانست با این لینک عضو شود ({type(e).__name__}). لینک منقضی یا نامعتبر است؟"
+    return chat.id, getattr(chat, "title", None), getattr(chat, "username", None), None
+
+
+async def _title_of(api: BotApi, chat_id: int, title):
+    if title:
+        return title
+    try:
+        return (await api.get_chat(chat_id)).get("title") or str(chat_id)
     except (BotApiError, BotApiNetworkError):
-        return None, None, None
-    return info["id"], info.get("title"), info.get("username")
+        return str(chat_id)
 
 
 @admin_bot.on_message(filters.private & admin_only & ~filters.command(["start", "menu", "cancel"]), group=2)
@@ -107,18 +144,15 @@ async def v2_text(client: Client, message: Message):
             await _forced_chat(message, admin_id)
         elif step == "forced_link":
             await _forced_link(message, admin_id, text)
-        elif step == "tpl_caption":
-            ok, err = logic.validate_template(text)
+        elif step == "tpl_suffix":
+            suffix = "" if text == "-" else (message.text or "").strip()
+            ok, err = logic.validate_suffix(suffix)
             if not ok:
                 await _reply(message, f"❌ {err}\nدوباره بفرستید یا /cancel")
                 return
-            await store.set_setting("tpl_caption", text)
+            await store.set_setting("caption_suffix", suffix)
             v2_states.pop(admin_id, None)
-            await _reply(message, "✅ قالب کپشن ذخیره شد (فقط برای پست‌های بعدی).", _back("v2:tpl"))
-        elif step == "tpl_promo":
-            await store.set_setting("tpl_promo", "" if text == "-" else text)
-            v2_states.pop(admin_id, None)
-            await _reply(message, "✅ متن تبلیغاتی ذخیره شد (فقط برای پست‌های بعدی).", _back("v2:tpl"))
+            await _reply(message, "✅ متن انتهای کپشن ذخیره شد (برای پست‌های بعدی).", _back("v2:tpl"))
         elif step == "tpl_button":
             ok, err = logic.validate_button_text(text)
             if not ok:
@@ -127,15 +161,15 @@ async def v2_text(client: Client, message: Message):
             await store.set_setting("tpl_button", text)
             v2_states.pop(admin_id, None)
             await _reply(message, "✅ متن دکمه ذخیره شد (فقط برای پست‌های بعدی).", _back("v2:tpl"))
-        elif step == "delmin":
+        elif step == "delsec":
             try:
-                minutes = logic.parse_delete_minutes(text)
+                seconds = logic.parse_delete_seconds(text)
             except ValueError as e:
                 await _reply(message, f"❌ {e}\nدوباره بفرستید یا /cancel")
                 return
-            await store.set_setting("delete_after_min", str(minutes))
+            await store.set_setting("delete_after_sec", str(seconds))
             v2_states.pop(admin_id, None)
-            await _reply(message, f"✅ زمان حذف: {logic.format_duration(minutes)} (برای ویدیوهای بعدی).", _back())
+            await _reply(message, f"✅ زمان حذف: {logic.format_duration(seconds)} (برای ویدیوهای بعدی).", _back())
     except Exception as e:
         logger.error(f"v2 text step {step} failed: {type(e).__name__}: {e}", exc_info=True)
         v2_states.pop(admin_id, None)
@@ -199,30 +233,38 @@ async def _set_final(message: Message, admin_id: int):
         await _reply(message, "اول یک ربات دریافت اضافه کنید؛ تست ارسال با آن انجام می‌شود.", _back())
         v2_states.pop(admin_id, None)
         return
-    chat_id, title, _ = await _resolve_chat(message)
+    chat_id, title, _, error = await _resolve_chat(message)
     if chat_id is None:
-        await _reply(message, "کانال شناخته نشد. یک پیام از کانال فوروارد کنید، یا آیدی عددی/@یوزرنیم بفرستید.\nلغو: /cancel")
+        await _reply(message, f"❌ {error}\nلغو: /cancel")
         return
     err = await _send_test(api, chat_id)
     if err:
-        await _reply(message, f"❌ ربات نتوانست در این کانال پیام بفرستد ({err}).\n"
-                              "ربات را ادمین کانال کنید (اجازه‌ی ارسال پست) و دوباره بفرستید.\nلغو: /cancel")
+        hint = ("ربات این کانال را نمی‌شناسد؛ ربات را به کانال اضافه کنید." if "chat not found" in err.lower()
+                else "ربات را ادمین کانال کنید (اجازه‌ی «ارسال پست») و دوباره بفرستید.")
+        await _reply(message, f"❌ ربات نتوانست در این کانال پیام بفرستد.\nخطای تلگرام: {err}\n{hint}\nلغو: /cancel")
         return
+    title = await _title_of(api, chat_id, title)
     await store.set_setting("final_chat_id", str(chat_id))
     await store.set_setting("final_chat_title", title or "")
     v2_states.pop(admin_id, None)
-    await _reply(message, f"✅ کانال نهایی تنظیم شد: {title or chat_id}\n(پیام آزمایشی ارسال و پاک شد)", _back())
+    await _reply(message, f"✅ کانال نهایی تنظیم شد: {title}\n(پیام آزمایشی ارسال و پاک شد)", _back())
 
 
 # ---------- عضویت اجباری ----------
 async def _forced_chat(message: Message, admin_id: int):
-    chat_id, title, username = await _resolve_chat(message)
+    chat_id, title, username, error = await _resolve_chat(message)
     if chat_id is None:
-        await _reply(message, "کانال شناخته نشد. یک پیام از کانال فوروارد کنید، یا آیدی عددی/@یوزرنیم بفرستید.\n"
-                              "(برای کانال خصوصی حتماً فوروارد یا آیدی عددی)\nلغو: /cancel")
+        await _reply(message, f"❌ {error}\n(برای کانال خصوصی حتماً فوروارد یا آیدی عددی)\nلغو: /cancel")
         return
+    api = await _any_api()
+    if api is not None:
+        title = await _title_of(api, chat_id, title)
     if username:
         await _finish_forced(message, admin_id, chat_id, title, f"https://t.me/{username}")
+        return
+    typed = (message.text or "").strip()
+    if re.match(r"^https://t\.me/(\+|joinchat/)", typed):      # لینک دعوتی که فرستاده شد، خودش لینک دکمه است
+        await _finish_forced(message, admin_id, chat_id, title, typed)
         return
     v2_states[admin_id] = {"step": "forced_link", "chat_id": chat_id, "title": title or str(chat_id)}
     await _reply(message, "این کانال یوزرنیم عمومی ندارد. لینک دعوتش (https://t.me/+...) را بفرستید تا روی دکمه‌ی "
@@ -272,14 +314,29 @@ async def _route(cq: CallbackQuery, data: str):
     admin_id = cq.from_user.id
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else "home"
-    if action in ("home", "bots", "forced", "tpl", "stats", "issues", "health", "final", "del"):
+    if action in ("home", "togc", "togd", "bots", "forced", "tpl", "stats", "issues", "health", "final", "del"):
         login_states.pop(admin_id, None)
         v2_states.pop(admin_id, None)
 
+    if action in ("togc", "togd"):
+        key = "collect_enabled" if action == "togc" else "distribute_enabled"
+        now_on = await distribution.flags.get(key)
+        await store.set_setting(key, "0" if now_on else "1")
+        distribution.flags.invalidate(key)
+        action = "home"
+
     if action == "home":
-        await _edit(cq, "🚀 توزیع و انتشار\n(مخزن همان «مقصد ارسال» است)", kb([
+        collect = await distribution.flags.get("collect_enabled")
+        distribute = await distribution.flags.get("distribute_enabled")
+        await _edit(cq, "🚀 توزیع و انتشار\n(مخزن همان «مقصد ارسال» است)\n\n"
+                        f"جمع‌آوری ویدیو و کپشن: {'🟢 روشن' if collect else '🔴 خاموش'}\n"
+                        f"توزیع و انتشار: {'🟢 روشن' if distribute else '🔴 خاموش'}\n\n"
+                        "خاموش‌بودن جمع‌آوری: پست‌های آن مدت رد می‌شوند و بعد از روشن‌شدن از همان‌جا ادامه می‌دهد.\n"
+                        "خاموش‌بودن توزیع: انتشار پست جدید متوقف می‌شود (صف می‌ماند)؛ دکمه‌های قبلی کار می‌کنند.", kb([
+            [(f"{'🟢' if collect else '🔴'} جمع‌آوری: {'روشن' if collect else 'خاموش'}", "v2:togc")],
+            [(f"{'🟢' if distribute else '🔴'} توزیع و انتشار: {'روشن' if distribute else 'خاموش'}", "v2:togd")],
             [("🤖 ربات‌های دریافت", "v2:bots"), ("📢 کانال نهایی", "v2:final")],
-            [("🔒 عضویت اجباری", "v2:forced"), ("✍️ قالب کپشن و دکمه", "v2:tpl")],
+            [("🔒 عضویت اجباری", "v2:forced"), ("✍️ کپشن و دکمه", "v2:tpl")],
             [("⏱ زمان حذف ویدیو", "v2:del"), ("🗄 مخزن (مقصد)", "dest")],
             [("📈 آمار", "v2:stats"), ("⚠️ ناموفق‌ها", "v2:issues")],
             [("🩺 سلامت و آزمایش اتصال", "v2:health")],
@@ -335,8 +392,9 @@ async def _route(cq: CallbackQuery, data: str):
 
     elif action == "finalset":
         v2_states[admin_id] = {"step": "final_chat"}
-        await _edit(cq, "کانال نهایی را بفرستید: یک پیام از آن فوروارد کنید، یا آیدی عددی/@یوزرنیم.\n"
-                        "ربات‌های دریافت باید در آن ادمین با اجازه‌ی «ارسال پست» باشند.\nلغو: /cancel", _back("v2:final"))
+        await _edit(cq, "کانال یا گروه نهایی را بفرستید: فوروارد یک پیام، آیدی عددی، @یوزرنیم یا لینک دعوت خصوصی (t.me/+...).\n"
+                        "با لینک دعوت، اکانت جمع‌کننده عضو می‌شود و آیدی را پیدا می‌کند.\n"
+                        "ربات‌های دریافت را خودتان در آن اضافه کنید (کانال: ادمین با اجازه‌ی ارسال پست؛ گروه: عضو).\nلغو: /cancel", _back("v2:final"))
 
     elif action == "finaltest":
         fid = await _final_chat_id()
@@ -393,54 +451,53 @@ async def _route(cq: CallbackQuery, data: str):
                         kb([[("🔁 فعال/غیرفعال", f"v2:fcact:{pk}"), ("🔍 آزمایش", f"v2:fctest:{pk}")],
                             [("🗑 حذف", f"v2:fcdel:{pk}")], [("🔙 بازگشت", "v2:forced")]]))
 
-    # ----- قالب -----
+    # ----- کپشن و دکمه -----
     elif action == "tpl":
-        t = await store.get_setting("tpl_caption", logic.DEFAULT_TPL_CAPTION)
-        promo = await store.get_setting("tpl_promo", "") or "(خالی)"
+        suffix = await store.get_setting("caption_suffix", "") or "(خالی)"
         btn = await store.get_setting("tpl_button", logic.DEFAULT_TPL_BUTTON)
-        await _edit(cq, f"قالب کپشن:\n{t}\n\nمتن تبلیغاتی:\n{promo}\n\nمتن دکمه: {btn}\n\n"
-                        "متغیرها: {caption} = کپشن تمیزشده‌ی پست اصلی، {promo} = متن تبلیغاتی.\n"
+        await _edit(cq, "کپشن نهایی = همان کپشنی که در مخزن ذخیره می‌شود + متن انتهایی زیر.\n\n"
+                        f"متن انتهای کپشن:\n{suffix}\n\nمتن دکمه: {btn}\n\n"
+                        "کانال نهایی فقط کپشن و دکمه می‌گیرد؛ ویدیوها فقط داخل ربات دریافت‌اند.\n"
                         "تغییر فقط روی پست‌های بعدی اثر دارد.",
-                    kb([[("✏️ قالب کپشن", "v2:tplc"), ("✏️ متن تبلیغاتی", "v2:tplp")],
-                        [("✏️ متن دکمه", "v2:tplb"), ("👁 پیش‌نمایش", "v2:tplv")],
-                        [("🔙 بازگشت", HOME)]]))
+                    kb([[("➕ متن انتهای کپشن", "v2:tpls")], [("✏️ متن دکمه", "v2:tplb")],
+                        [("👁 پیش‌نمایش", "v2:tplv")], [("🔙 بازگشت", HOME)]]))
 
-    elif action in ("tplc", "tplp", "tplb"):
+    elif action in ("tpls", "tplb"):
         step, prompt = {
-            "tplc": ("tpl_caption", "قالب کپشن را بفرستید. فقط {caption} و {promo} مجازند. مثال:\n{caption}\n\n{promo}"),
-            "tplp": ("tpl_promo", "متن تبلیغاتی (آیدی کانال/لینک‌ها) را بفرستید. برای خالی‌کردن: -"),
-            "tplb": ("tpl_button", "متن دکمه‌ی شیشه‌ی زیر پست را بفرستید (حداکثر ۴۰ نویسه)."),
+            "tpls": ("tpl_suffix", "متنی که همیشه آخر کپشن اضافه شود را بفرستید (آیدی کانال، توضیحات، لینک‌ها). "
+                                   "برای خالی‌کردن: -"),
+            "tplb": ("tpl_button", "متن دکمه‌ی شیشه‌ای زیر پست را بفرستید (حداکثر ۴۰ نویسه)."),
         }[action]
         v2_states[admin_id] = {"step": step}
         await _edit(cq, prompt + "\nلغو: /cancel", _back("v2:tpl"))
 
     elif action == "tplv":
-        t = await store.get_setting("tpl_caption", logic.DEFAULT_TPL_CAPTION)
-        promo = await store.get_setting("tpl_promo", "") or ""
+        suffix = await store.get_setting("caption_suffix", "") or ""
         try:
-            text, trimmed = logic.compose_caption(t, "نمونه‌ی کپشن اصلی ویدیو", promo)
-            await _edit(cq, "پیش‌نمایش:\n\n" + text + ("\n\n(کپشن کوتاه شد)" if trimmed else ""), _back("v2:tpl"))
+            text, trimmed = logic.compose_final("نمونه‌ی کپشن ذخیره‌شده در مخزن", suffix, logic.POST_TEXT_LIMIT)
+            await _edit(cq, "پیش‌نمایش پست کانال نهایی:\n\n" + (text or logic.DEFAULT_POST_TEXT),
+                        _back("v2:tpl"))
         except logic.TemplateTooLong as e:
             await _edit(cq, f"❌ {e}", _back("v2:tpl"))
 
-    # ----- زمان حذف -----
+    # ----- زمان حذف (ثانیه) -----
     elif action == "del":
-        raw = await store.get_setting("delete_after_min")
-        cur = int(raw) if raw and raw.isdigit() else logic.DEFAULT_DELETE_MINUTES
+        raw = await store.get_setting("delete_after_sec")
+        cur = int(raw) if raw and raw.isdigit() else logic.DEFAULT_DELETE_SECONDS
         await _edit(cq, f"ویدیو {logic.format_duration(cur)} بعد از ارسال از چت کاربر حذف می‌شود.\n"
-                        "(حداکثر کمتر از ۴۸ ساعت؛ فقط برای ویدیوهای بعدی اثر دارد.)",
-                    kb([[("10 دقیقه", "v2:delset:10"), ("30 دقیقه", "v2:delset:30")],
-                        [("1 ساعت", "v2:delset:60"), ("3 ساعت", "v2:delset:180")],
-                        [("✏️ عدد دلخواه (دقیقه)", "v2:delcustom")], [("🔙 بازگشت", HOME)]]))
+                        "(از ۵ ثانیه تا کمتر از ۴۸ ساعت؛ فقط برای ویدیوهای بعدی اثر دارد.)",
+                    kb([[("30 ثانیه", "v2:delset:30"), ("60 ثانیه", "v2:delset:60")],
+                        [("5 دقیقه", "v2:delset:300"), ("1 ساعت", "v2:delset:3600")],
+                        [("✏️ عدد دلخواه (ثانیه)", "v2:delcustom")], [("🔙 بازگشت", HOME)]]))
 
     elif action == "delset":
-        minutes = logic.parse_delete_minutes(parts[2])
-        await store.set_setting("delete_after_min", str(minutes))
-        await _edit(cq, f"✅ زمان حذف: {logic.format_duration(minutes)}", _back("v2:del"))
+        seconds = logic.parse_delete_seconds(parts[2])
+        await store.set_setting("delete_after_sec", str(seconds))
+        await _edit(cq, f"✅ زمان حذف: {logic.format_duration(seconds)}", _back("v2:del"))
 
     elif action == "delcustom":
-        v2_states[admin_id] = {"step": "delmin"}
-        await _edit(cq, "زمان حذف را به دقیقه بفرستید (۱ تا ۲۸۲۰).\nلغو: /cancel", _back("v2:del"))
+        v2_states[admin_id] = {"step": "delsec"}
+        await _edit(cq, "زمان حذف را به ثانیه بفرستید (۵ تا ۱۶۹۲۰۰).\nلغو: /cancel", _back("v2:del"))
 
     # ----- آمار / خطاها / سلامت -----
     elif action == "stats":

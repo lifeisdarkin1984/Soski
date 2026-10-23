@@ -32,6 +32,36 @@ def choose_button(buttons: Sequence[Any]) -> Optional[Any]:
     return None
 
 
+def get_video(message: Any) -> Optional[Tuple[str, Any]]:
+    """فقط ویدیو: ویدیوی عادی، یا فایلی (document) که نوعش video/* است. عکس، گیف، صدا و بقیه رد می‌شوند."""
+    vid = getattr(message, 'video', None)
+    if vid:
+        return 'video', vid
+    doc = getattr(message, 'document', None)
+    if doc and str(getattr(doc, 'mime_type', '') or '').lower().startswith('video/'):
+        return 'document', doc
+    return None
+
+
+def pick_videos(history: Sequence[Any], baseline_id: int, limit: int = 20) -> List[Any]:
+    """همه‌ی ویدیوهای تازه‌ی ربات (بعد از baseline_id)، از قدیمی به جدید، بدون تکرار."""
+    seen, out = set(), []
+    for m in sorted(history, key=lambda x: x.id):
+        if m.id <= baseline_id or getattr(m, 'outgoing', False):
+            continue
+        found = get_video(m)
+        if not found:
+            continue
+        uid = getattr(found[1], 'file_unique_id', None) or m.id
+        if uid in seen:
+            continue
+        seen.add(uid)
+        out.append(m)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def get_media(message: Any) -> Optional[Tuple[str, Any]]:
     for attr in MEDIA_ATTRS:
         obj = getattr(message, attr, None)
@@ -51,7 +81,7 @@ def pick_bot_message(history: Sequence[Any], baseline_id: int) -> Tuple[Optional
         return None, baseline_id
     newest = max(m.id for m in new)
     for m in new:
-        if get_media(m):
+        if get_video(m):
             return m, newest
     for m in new:
         if getattr(m, 'reply_markup', None):

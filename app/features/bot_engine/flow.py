@@ -1,5 +1,5 @@
 import asyncio
-from typing import Optional, Tuple, Set
+from typing import List, Optional, Tuple, Set
 from pyrogram import Client
 from pyrogram.types import Message
 from pyrogram.errors import FloodWait, UserIsBlocked, UserAlreadyParticipant, InviteHashExpired, InviteHashInvalid
@@ -10,7 +10,7 @@ from app.core.link_parser import link_parser
 from app.repositories.flow_repository import FlowRepository
 from app.models.message import ProcessedMessage, FlowStatus
 from app.features.bot_engine.helpers import (
-    choose_button, get_media, pick_bot_message, join_target, build_start_text, reply_keyboard_texts, unwrap_chat,
+    choose_button, get_video, pick_videos, pick_bot_message, join_target, build_start_text, reply_keyboard_texts, unwrap_chat,
 )
 
 MAX_INTERACTION_STEPS = 8
@@ -18,6 +18,9 @@ MAX_JOIN_RETRIES_PER_CHANNEL = 2
 MAX_JOIN_FAILURES = 3
 RESPONSE_TIMEOUT = 15.0     # حداکثر انتظار برای پاسخ ربات در هر مرحله
 POLL_INTERVAL = 1.5
+SETTLE_SECONDS = 5.0        # بعد از آخرین ویدیوی تازه این‌قدر صبر می‌کنیم تا ویدیوهای بعدیِ ربات برسند
+MAX_COLLECT_SECONDS = 60.0
+MAX_VIDEOS = 20
 MAX_FLOOD_SLEEP = 300
 
 
@@ -42,13 +45,13 @@ async def _flood_safe(factory, attempts: int = 3):
 class BotFlowEngine:
     @staticmethod
     async def process_request(client: Client, processed_msg_id: int, bot_username: str, account_id: int,
-                              start_param: Optional[str] = None) -> Tuple[Optional[Message], int]:
+                              start_param: Optional[str] = None) -> Tuple[List[Message], int]:
         async with AsyncSessionLocal() as db:
             flow_repo = FlowRepository(db)
             p_msg = (await db.execute(
                 select(ProcessedMessage).where(ProcessedMessage.id == processed_msg_id))).scalar_one_or_none()
             if not p_msg:
-                return None, 0
+                return [], 0
             start_param = start_param or p_msg.start_param
             start_text = build_start_text(start_param)
             await flow_repo.mark_message_processing(processed_msg_id)
@@ -63,12 +66,14 @@ class BotFlowEngine:
                 await flow_repo.update_flow_status(processed_msg_id, FlowStatus.interacting)
 
                 for step in range(MAX_INTERACTION_STEPS):
+                    wait_from = baseline
                     bot_msg, baseline = await BotFlowEngine._wait_for_bot_message(client, bot_username, baseline)
                     if bot_msg is None:
                         raise FlowAbort("Bot did not respond in time")
 
-                    if get_media(bot_msg):
-                        return bot_msg, joined_count
+                    if get_video(bot_msg):
+                        videos = await BotFlowEngine._collect_videos(client, bot_username, wait_from)
+                        return (videos or [bot_msg]), joined_count
 
                     markup = bot_msg.reply_markup
                     inline_rows = getattr(markup, 'inline_keyboard', None) or []
@@ -120,14 +125,34 @@ class BotFlowEngine:
                 raise FlowAbort("Max interaction steps reached")
             except FlowAbort as e:
                 await flow_repo.mark_message_failed(processed_msg_id, str(e))
-                return None, 0
+                return [], 0
             except UserIsBlocked as e:
                 await flow_repo.mark_message_failed(processed_msg_id, f"Blocked by bot: {e}")
-                return None, 0
+                return [], 0
             except Exception as e:
                 logger.error(f"Flow error for @{bot_username}: {e}", exc_info=True)
                 await flow_repo.mark_message_failed(processed_msg_id, f"{type(e).__name__}: {e}")
-                return None, 0
+                return [], 0
+
+    @staticmethod
+    async def _collect_videos(client: Client, bot_username: str, from_id: int) -> List[Message]:
+        """ربات ممکن است چند ویدیو پشت‌سرهم بفرستد؛ تا وقتی ویدیوی تازه می‌رسد صبر می‌کنیم."""
+        loop = asyncio.get_running_loop()
+        start = last_change = loop.time()
+        videos: List[Message] = []
+        while True:
+            try:
+                history = [m async for m in client.get_chat_history(bot_username, limit=40)]
+                found = pick_videos(history, from_id, MAX_VIDEOS)
+                if len(found) > len(videos):
+                    videos, last_change = found, loop.time()
+            except FloodWait as e:
+                await asyncio.sleep(min(int(e.value) + 1, MAX_FLOOD_SLEEP))
+            now = loop.time()
+            if (len(videos) >= MAX_VIDEOS or now - last_change >= SETTLE_SECONDS
+                    or now - start >= MAX_COLLECT_SECONDS):
+                return videos
+            await asyncio.sleep(POLL_INTERVAL)
 
     @staticmethod
     async def _wait_for_bot_message(client: Client, bot_username: str, baseline: int):

@@ -7,7 +7,8 @@ from typing import Awaitable, Callable
 
 from app.features.distribution.botapi import BotApi, BotApiError, BotApiNetworkError
 from app.features.distribution.logic import (
-    DEFAULT_TPL_BUTTON, DEFAULT_TPL_CAPTION, TemplateTooLong, build_deep_link, compose_caption, utcnow,
+    DEFAULT_POST_TEXT, DEFAULT_TPL_BUTTON, POST_TEXT_LIMIT, TemplateTooLong, VIDEO_CAPTION_LIMIT,
+    build_deep_link, compose_final, utcnow,
 )
 
 log = logging.getLogger("Collector.distribution")
@@ -16,21 +17,24 @@ MAX_PUBLISH_ATTEMPTS = 3
 RETRY_DELAY_SECONDS = 60
 
 
-async def enqueue_post(store, delivery_id: int, storage_chat_id: int, storage_msg_id: int, caption: str) -> bool:
-    """بعد از ذخیره‌ی موفق ویدیو در مخزن صدا زده می‌شود. تکراری بی‌اثر است (idempotent)."""
+async def enqueue_post(store, delivery_id: int, storage_chat_id: int, storage_msg_ids: list, caption: str) -> bool:
+    """بعد از ذخیره‌ی موفق ویدیوها در مخزن صدا زده می‌شود (یک «بسته» = همه‌ی ویدیوهای یک پست).
+    تکراری بی‌اثر است (idempotent)."""
     from app.features.distribution.logic import make_token
-    return await store.enqueue_post(delivery_id, storage_chat_id, storage_msg_id, caption or "", make_token())
+    return await store.enqueue_post(delivery_id, storage_chat_id, list(storage_msg_ids), caption or "", make_token())
 
 
 class PostPublisher:
-    def __init__(self, store, api_for: Callable[[int], Awaitable[BotApi]], now_fn: Callable = utcnow):
+    def __init__(self, store, api_for: Callable[[int], Awaitable[BotApi]], now_fn: Callable = utcnow, flags=None):
         self.store = store
         self.api_for = api_for
         self.now = now_fn
-        self._last_no_bot_warn = None
+        self.flags = flags              # FlagCache (اختیاری)
 
     async def run_once(self) -> bool:
-        """یک پست را پردازش می‌کند؛ True یعنی کاری انجام شد."""
+        """یک بسته را منتشر می‌کند؛ True یعنی کاری انجام شد."""
+        if self.flags is not None and not await self.flags.get("distribute_enabled"):
+            return False                # توزیع خاموش: صف می‌ماند
         final_raw = await self.store.get_setting("final_chat_id")
         if not final_raw:
             return False
@@ -40,11 +44,12 @@ class PostPublisher:
             return False
         post, bot = claim
 
-        tpl = await self.store.get_setting("tpl_caption") or DEFAULT_TPL_CAPTION
-        promo = await self.store.get_setting("tpl_promo") or ""
+        suffix = await self.store.get_setting("caption_suffix") or ""
         button = await self.store.get_setting("tpl_button") or DEFAULT_TPL_BUTTON
         try:
-            caption, trimmed = compose_caption(tpl, post.caption, promo)
+            # کانال نهایی فقط کپشن + دکمه می‌گیرد؛ ویدیوها فقط داخل ربات دریافت‌اند
+            post_text, _ = compose_final(post.caption, suffix, POST_TEXT_LIMIT)
+            video_caption, trimmed = compose_final(post.caption, suffix, VIDEO_CAPTION_LIMIT)
         except TemplateTooLong as e:
             await self.store.mark_post_failed(post.id, str(e))
             log.error(f"Post {post.id}: {e}")
@@ -53,8 +58,7 @@ class PostPublisher:
         keyboard = {"inline_keyboard": [[{"text": button, "url": build_deep_link(bot.username, post.token)}]]}
         try:
             api = await self.api_for(bot.id)
-            res = await api.copy_message(final_chat, post.storage_chat_id, post.storage_msg_id,
-                                         caption=caption, reply_markup=keyboard)
+            res = await api.send_message(final_chat, post_text or DEFAULT_POST_TEXT, reply_markup=keyboard)
         except BotApiNetworkError:
             # شاید منتشر شده باشد؛ بدون بررسی دستی دوباره نمی‌فرستیم
             await self.store.mark_post_unknown(post.id, "network error; result unknown")
@@ -70,13 +74,8 @@ class PostPublisher:
             log.error(f"Post {post.id}: publish failed ({reason})")
             return True
 
-        final_msg_id = int(res["message_id"])
-        await self.store.mark_post_published(post.id, final_chat, final_msg_id, caption, trimmed, self.now())
-        if trimmed and post.caption:
-            try:   # کپشن بلند بی‌صدا حذف نمی‌شود: متن کامل زیر پست می‌آید
-                await api.send_message(final_chat, post.caption, reply_to_message_id=final_msg_id)
-            except (BotApiError, BotApiNetworkError) as e:
-                log.warning(f"Post {post.id}: full caption message failed: {type(e).__name__}")
+        await self.store.mark_post_published(post.id, final_chat, int(res["message_id"]), video_caption, trimmed,
+                                             self.now())
         return True
 
     async def run_forever(self):

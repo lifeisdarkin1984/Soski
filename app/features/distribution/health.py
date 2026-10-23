@@ -39,9 +39,18 @@ async def check_bot(api: BotApi, bot_tg_id: int, storage_chat: Optional[int], fi
 
     if final_chat is not None:
         m, err = await _member(api, final_chat, bot_tg_id)
-        ok = bool(m) and bot_can_post(m)
-        checks.append(Check("ارسال در کانال نهایی", ok,
-                            "اجازه‌ی ارسال دارد" if ok else (err or "ربات باید ادمین با اجازه‌ی «ارسال پست» باشد")))
+        chat_type = "channel"
+        try:
+            chat_type = (await api.get_chat(final_chat)).get("type", "channel")
+        except (BotApiError, BotApiNetworkError):
+            pass
+        if chat_type == "channel":                # کانال: ادمین با اجازه‌ی ارسال پست
+            ok = bool(m) and bot_can_post(m)
+            hint = "ربات باید ادمین با اجازه‌ی «ارسال پست» باشد"
+        else:                                     # گروه: عضو یا ادمین بودن کافی است
+            ok = bool(m) and m.get("status") in ("member", "administrator", "creator")
+            hint = "ربات باید عضو گروه باشد"
+        checks.append(Check("ارسال در کانال نهایی", ok, "اجازه‌ی ارسال دارد" if ok else (err or hint)))
 
     for ch in forced:
         m, err = await _member(api, ch.chat_id, bot_tg_id)

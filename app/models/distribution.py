@@ -37,7 +37,8 @@ class MediaPost(Base):
                                              unique=True, nullable=False)
     token: Mapped[str] = mapped_column(String(32), unique=True, nullable=False)         # بخش یکتای لینک اختصاصی
     storage_chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    storage_msg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    storage_msg_id: Mapped[int] = mapped_column(BigInteger, nullable=False)              # اولین ویدیو
+    storage_msg_ids: Mapped[str] = mapped_column(Text, nullable=True)                    # همه‌ی ویدیوها: JSON مثل [101,102]
     caption: Mapped[str] = mapped_column(Text, nullable=True)                           # کپشن تمیزشده‌ی پست اصلی
     final_caption: Mapped[str] = mapped_column(Text, nullable=True)
     caption_trimmed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)

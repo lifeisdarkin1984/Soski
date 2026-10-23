@@ -7,8 +7,8 @@ from typing import Awaitable, Callable, Optional
 
 from app.features.distribution.botapi import BotApi, BotApiError, BotApiNetworkError
 from app.features.distribution.logic import (
-    DEFAULT_DELETE_MINUTES, TOKEN_RE, evaluate_membership, format_duration, interpret_member_status,
-    parse_payload, parse_start_command, utcnow,
+    DEFAULT_DELETE_SECONDS, MAX_DELETE_SECONDS, MIN_DELETE_SECONDS, TOKEN_RE, evaluate_membership,
+    format_duration, interpret_member_status, parse_msg_ids, parse_payload, parse_start_command, utcnow,
 )
 
 log = logging.getLogger("Collector.distribution")
@@ -19,13 +19,14 @@ T_NEED_JOIN = "برای دریافت ویدیو ابتدا در کانال(ها�
 T_CHECK_FAILED = "الان امکان بررسی عضویت شما نیست. چند لحظه بعد دوباره دکمه‌ی زیر را بزنید."
 T_SEND_FAILED = "ارسال ویدیو با خطا روبه‌رو شد. کمی بعد دوباره امتحان کنید."
 T_SEND_UNKNOWN = "اگر ویدیو به دستتان نرسید، دوباره دکمه‌ی دریافت را بزنید."
+T_PARTIAL = "بخشی از ویدیوها ارسال نشد. برای دریافت دوباره، دکمه‌ی زیر را بزنید."
 T_BUSY = "در حال ارسال… لطفاً چند لحظه صبر کنید."
 BTN_CHECK = "✅ عضو شدم، بررسی کن"
 BTN_AGAIN = "🔄 دریافت مجدد"
 
 
-def guide_text(minutes: int) -> str:
-    return (f"⏳ این ویدیو بعد از {format_duration(minutes)} از این چت حذف می‌شود.\n"
+def guide_text(seconds: int) -> str:
+    return (f"⏳ این ویدیو بعد از {format_duration(seconds)} از این چت حذف می‌شود.\n"
             "بعد از حذف، با دکمه‌ی زیر دوباره دریافتش کنید.")
 
 
@@ -125,49 +126,55 @@ class ReceiverService:
             return None
 
     # ---------- ارسال ----------
-    async def _delete_minutes(self) -> int:
-        raw = await self.store.get_setting("delete_after_min")
+    async def _delete_seconds(self) -> int:
+        raw = await self.store.get_setting("delete_after_sec")
         try:
             v = int(raw)
-            return v if 1 <= v <= 47 * 60 else DEFAULT_DELETE_MINUTES
         except (TypeError, ValueError):
-            return DEFAULT_DELETE_MINUTES
+            old = await self.store.get_setting("delete_after_min")      # تنظیم قدیمیِ دقیقه‌ای
+            v = int(old) * 60 if (old or "").isdigit() else DEFAULT_DELETE_SECONDS
+        return v if MIN_DELETE_SECONDS <= v <= MAX_DELETE_SECONDS else DEFAULT_DELETE_SECONDS
 
     async def _deliver(self, user_id: int, chat_id: int, post, cb_id: Optional[str]):
         if await self.store.recent_delivery_exists(user_id, post.id, 3):
             await self._answer(cb_id, T_BUSY)
             return
-        delivery_id = await self.store.create_delivery(post.id, self.bot_pk, user_id)
-        try:
-            res = await self.api.copy_message(chat_id, post.storage_chat_id, post.storage_msg_id,
-                                              caption=post.final_caption)
-        except BotApiNetworkError:
-            # شاید ارسال شده باشد؛ خودکار دوباره نمی‌فرستیم
-            await self.store.mark_delivery(delivery_id, "unknown", "network error; result unknown")
-            await self.store.bump_bot(self.bot_pk, errors=1)
-            log.error(f"Send to user {user_id} has unknown result (network)")
-            await self._answer(cb_id)
-            await self._say(chat_id, T_SEND_UNKNOWN,
-                            {"inline_keyboard": [[{"text": BTN_AGAIN, "callback_data": f"re:{post.token}"}]]})
-            return
-        except BotApiError as e:
-            await self.store.mark_delivery(delivery_id, "send_failed", f"{e.code}: {e.description}"[:255])
-            if e.code != 403:    # 403 = کاربر ربات را بلاک کرده؛ خطای سیستم نیست
+        again_markup = {"inline_keyboard": [[{"text": BTN_AGAIN, "callback_data": f"re:{post.token}"}]]}
+        ids = parse_msg_ids(getattr(post, "storage_msg_ids", None), post.storage_msg_id)
+        seconds = await self._delete_seconds()
+        sent_rows = []                       # (delivery_id)
+        for index, storage_msg_id in enumerate(ids):
+            delivery_id = await self.store.create_delivery(post.id, self.bot_pk, user_id)
+            caption = post.final_caption if index == 0 else None      # کپشن فقط روی ویدیوی اول
+            try:
+                res = await self.api.copy_message(chat_id, post.storage_chat_id, storage_msg_id, caption=caption)
+            except BotApiNetworkError:
+                # شاید ارسال شده باشد؛ خودکار دوباره نمی‌فرستیم
+                await self.store.mark_delivery(delivery_id, "unknown", "network error; result unknown")
                 await self.store.bump_bot(self.bot_pk, errors=1)
-                log.error(f"copyMessage failed for post {post.id}: {e.code} {e.description}")
-                await self._say(chat_id, T_SEND_FAILED)
+                log.error(f"Send to user {user_id} has unknown result (network)")
+                await self._answer(cb_id)
+                await self._say(chat_id, T_SEND_UNKNOWN, again_markup)
+                break
+            except BotApiError as e:
+                await self.store.mark_delivery(delivery_id, "send_failed", f"{e.code}: {e.description}"[:255])
+                if e.code != 403:    # 403 = کاربر ربات را بلاک کرده؛ خطای سیستم نیست
+                    await self.store.bump_bot(self.bot_pk, errors=1)
+                    log.error(f"copyMessage failed for post {post.id}: {e.code} {e.description}")
+                    await self._say(chat_id, T_PARTIAL if sent_rows else T_SEND_FAILED, again_markup)
+                await self._answer(cb_id)
+                break
+            now = self.now()
+            await self.store.mark_delivery_sent(delivery_id, int(res["message_id"]),
+                                                now + timedelta(seconds=seconds), now)
+            sent_rows.append(delivery_id)
+        else:
+            # همه ارسال شد
+            if not await self.store.has_guide(user_id, post.id):
+                guide = await self._say(chat_id, guide_text(seconds), again_markup)
+                if guide:
+                    await self.store.set_guide(sent_rows[0], int(guide["message_id"]))
             await self._answer(cb_id)
-            return
-
-        minutes = await self._delete_minutes()
-        now = self.now()
-        await self.store.mark_delivery_sent(delivery_id, int(res["message_id"]), now + timedelta(minutes=minutes), now)
-        if not await self.store.has_guide(user_id, post.id):
-            guide = await self._say(chat_id, guide_text(minutes),
-                                    {"inline_keyboard": [[{"text": BTN_AGAIN, "callback_data": f"re:{post.token}"}]]})
-            if guide:
-                await self.store.set_guide(delivery_id, int(guide["message_id"]))
-        await self._answer(cb_id)
 
     # ---------- ابزار ----------
     async def _say(self, chat_id: int, text: str, markup: Optional[dict] = None) -> Optional[dict]:

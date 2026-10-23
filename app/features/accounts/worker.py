@@ -13,6 +13,7 @@ from app.features.monitor.scanner import perform_initial_scan, catch_up_missed
 from app.features.detector.analyzer import analyzer
 from app.features.bot_engine.flow import bot_flow_engine
 from app.features.publisher.publisher import publisher
+from app.features.distribution.runtime import distribution
 
 MAX_CONCURRENT_FLOWS = 3
 
@@ -101,6 +102,11 @@ class AccountWorker:
                         f"bot={analysis['bot_username'] or '-'}")
             if not monitored:
                 return
+            if not await distribution.flags.get("collect_enabled"):
+                # جمع‌آوری خاموش است: پست رد می‌شود و «نقطه‌ی ادامه» جلو می‌رود تا بعد از روشن‌شدن از همان‌جا ادامه دهد
+                async with AsyncSessionLocal() as db:
+                    await ChannelRepository(db).update_last_processed_msg(chat_id, self.account_id, message.id)
+                return
             async with AsyncSessionLocal() as db:
                 if analysis['is_media_request']:
                     p_msg = await MessageRepository(db).mark_as_pending_request(
@@ -138,13 +144,13 @@ class AccountWorker:
                 logger.warning("Destination not set; request stays pending until it is set in the admin bot.")
                 return
             async with self._flow_semaphore:
-                bot_media_msg, joined_count = await bot_flow_engine.process_request(
+                videos, joined_count = await bot_flow_engine.process_request(
                     client=self.client, processed_msg_id=processed_msg_id,
                     bot_username=bot_username, account_id=self.account_id)
-                if not bot_media_msg:
+                if not videos:
                     return
                 await publisher.publish_media(
-                    client=self.client, bot_media_msg=bot_media_msg,
+                    client=self.client, bot_media_msgs=videos,
                     source_channel_id=channel_id, source_msg_id=message_id,
                     account_id=self.account_id, target_bot_username=bot_username,
                     joined_channels_count=joined_count, processed_msg_id=processed_msg_id)
